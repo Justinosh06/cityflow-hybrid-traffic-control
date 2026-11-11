@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import random
 import shutil
@@ -45,7 +46,11 @@ def _build_intersection_specs(roadnet):
         phases = traffic_light.get("lightphases", [])
         phase_lanes = {}
         phase_durations = {}
+        fixed_time_schedule = []
         for phase_index, phase in enumerate(phases):
+            duration = phase.get("time", 0)
+            if duration > 0:
+                fixed_time_schedule.append((phase_index, duration))
             lane_ids = set()
             for road_link_index in phase.get("availableRoadLinks", []):
                 if road_link_index < 0 or road_link_index >= len(road_links):
@@ -89,6 +94,7 @@ def _build_intersection_specs(roadnet):
                 phase_index: phase_lanes[phase_index] for phase_index in actions
             },
             "incoming_lanes": incoming_lanes,
+            "fixed_time_schedule": tuple(fixed_time_schedule),
         }
 
     if not specs:
@@ -113,26 +119,53 @@ def _intersection_queue(lane_waiting_counts, intersection_spec):
     )
 
 
-def _select_action(q_table, intersection_id, state, actions, epsilon, rng):
+def _fixed_time_phase(intersection_spec, step, interval):
+    schedule = intersection_spec["fixed_time_schedule"]
+    cycle_duration = sum(duration for _, duration in schedule)
+    elapsed_time = ((step - 1) * interval) % cycle_duration
+    for phase_index, duration in schedule:
+        if elapsed_time < duration:
+            return phase_index
+        elapsed_time -= duration
+    return schedule[-1][0]
+
+
+def _select_action(
+    q_table,
+    intersection_id,
+    state,
+    actions,
+    epsilon,
+    rng,
+    fixed_time_action,
+):
+    state_values = q_table.get(intersection_id, {}).get(state)
+    if not state_values:
+        return fixed_time_action
+
     if rng.random() < epsilon:
         return rng.choice(actions)
 
-    state_values = (
-        q_table.get(intersection_id, {})
-        .get(state, {})
-    )
-    best_value = max(state_values.get(action, 0.0) for action in actions)
+    best_value = max(state_values.get(action, float("-inf")) for action in actions)
     best_actions = [
         action
         for action in actions
-        if state_values.get(action, 0.0) == best_value
+        if state_values.get(action, float("-inf")) == best_value
     ]
     return rng.choice(best_actions)
 
 
-def _greedy_action(q_table, intersection_id, state, actions):
-    state_values = q_table.get(intersection_id, {}).get(state, {})
-    return max(actions, key=lambda action: state_values.get(action, 0.0))
+def _greedy_action(
+    q_table, intersection_id, state, actions, fixed_time_action
+):
+    state_values = q_table.get(intersection_id, {}).get(state)
+    if not state_values:
+        return fixed_time_action
+
+    return max(
+        actions,
+        key=lambda action: state_values.get(action, float("-inf")),
+    )
 
 
 def _update_q_value(
@@ -161,6 +194,10 @@ def _update_q_value(
     )
 
 
+def _hold_green_action(active_action, elapsed_steps, minimum_green_steps):
+    return active_action is not None and elapsed_steps < minimum_green_steps
+
+
 def _load_q_table(q_table_path, intersection_specs):
     if not q_table_path.is_file():
         return {}
@@ -186,34 +223,125 @@ def _load_q_table(q_table_path, intersection_specs):
     return payload["q_table"]
 
 
-def _scale_flow_demand(flows, demand_scale):
+def _scale_flow_demand(flows, demand_scale, vehicle_speed_scale=1.0):
+    if demand_scale <= 0:
+        raise ValueError("demand_scale must be positive.")
+    if vehicle_speed_scale <= 0:
+        raise ValueError("vehicle_speed_scale must be positive.")
+
     scaled_flows = json.loads(json.dumps(flows))
     for flow in scaled_flows:
         interval = flow.get("interval")
         if not isinstance(interval, (int, float)) or interval <= 0:
             raise ValueError("Every traffic flow must have a positive interval.")
         flow["interval"] = interval / demand_scale
+        vehicle = flow.get("vehicle", {})
+        max_speed = vehicle.get("maxSpeed")
+        if not isinstance(max_speed, (int, float)) or max_speed <= 0:
+            raise ValueError("Every traffic flow vehicle must have a positive maxSpeed.")
+        vehicle["maxSpeed"] = max_speed * vehicle_speed_scale
     return scaled_flows
+
+
+def _generate_scenario_uncertainties(
+    roadnet,
+    max_steps,
+    rng,
+    demand_variation,
+    vehicle_speed_variation,
+    breakdown_probability,
+    breakdown_duration_steps,
+):
+    if not 0 <= demand_variation < 1:
+        raise ValueError("demand_variation must be in the range [0, 1).")
+    if not 0 <= vehicle_speed_variation < 1:
+        raise ValueError("vehicle_speed_variation must be in the range [0, 1).")
+    if not 0 <= breakdown_probability <= 1:
+        raise ValueError("breakdown_probability must be in the range [0, 1].")
+    if breakdown_duration_steps <= 0:
+        raise ValueError("breakdown_duration_steps must be positive.")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive.")
+
+    lanes = [
+        f"{road['id']}_{lane_index}"
+        for road in roadnet.get("roads", [])
+        for lane_index, _lane in enumerate(road.get("lanes", []))
+    ]
+    incidents = []
+    if lanes and rng.random() < breakdown_probability:
+        incidents.append(
+            {
+                "type": "vehicle_breakdown",
+                "lane_id": rng.choice(lanes),
+                "start_step": rng.randint(1, max_steps),
+                "duration_steps": breakdown_duration_steps,
+            }
+        )
+
+    return {
+        "demand_scale": rng.uniform(
+            1 - demand_variation, 1 + demand_variation
+        ),
+        "vehicle_speed_scale": rng.uniform(
+            1 - vehicle_speed_variation, 1 + vehicle_speed_variation
+        ),
+        "seed": rng.randrange(0, 2**31),
+        "incidents": incidents,
+    }
+
+
+def _apply_scenario_incidents(engine, incidents, step, affected_vehicles):
+    active_lane_ids = {
+        incident["lane_id"]
+        for incident in incidents
+        if incident["start_step"]
+        <= step
+        < incident["start_step"] + incident["duration_steps"]
+    }
+    if not active_lane_ids:
+        return
+
+    lane_vehicles = engine.get_lane_vehicles()
+    for incident in incidents:
+        lane_id = incident["lane_id"]
+        if lane_id not in active_lane_ids:
+            continue
+        vehicle_id = affected_vehicles.get(lane_id)
+        vehicles = lane_vehicles.get(lane_id, [])
+        if vehicle_id not in vehicles:
+            affected_vehicles.pop(lane_id, None)
+            if not vehicles:
+                continue
+            vehicle_id = vehicles[0]
+            affected_vehicles[lane_id] = vehicle_id
+        engine.set_vehicle_speed(vehicle_id, 0)
 
 
 def run_rl_training(
     config_path="data/config.json",
     q_table_path="models/q_table.joblib",
-    episodes=5,
+    episodes=100,
     max_steps=3600,
     output_csv="data/training_metrics.csv",
     thread_num=4,
+    minimum_green_duration=10.0,
     learning_rate=0.1,
     discount_factor=0.95,
     epsilon_start=1.0,
     epsilon_end=0.05,
     demand_variation=0.2,
+    vehicle_speed_variation=0.15,
+    breakdown_probability=0.5,
+    breakdown_duration_steps=60,
     seed=0,
 ):
     if episodes <= 0:
         raise ValueError("episodes must be a positive integer.")
     if max_steps <= 0:
         raise ValueError("max_steps must be a positive integer.")
+    if minimum_green_duration <= 0:
+        raise ValueError("minimum_green_duration must be positive.")
     if not 0 < learning_rate <= 1:
         raise ValueError("learning_rate must be in the range (0, 1].")
     if not 0 <= discount_factor <= 1:
@@ -224,6 +352,12 @@ def run_rl_training(
         )
     if not 0 <= demand_variation < 1:
         raise ValueError("demand_variation must be in the range [0, 1).")
+    if not 0 <= vehicle_speed_variation < 1:
+        raise ValueError("vehicle_speed_variation must be in the range [0, 1).")
+    if not 0 <= breakdown_probability <= 1:
+        raise ValueError("breakdown_probability must be in the range [0, 1].")
+    if breakdown_duration_steps <= 0:
+        raise ValueError("breakdown_duration_steps must be positive.")
 
     config_file_path = _project_path(config_path)
     q_table_file_path = _project_path(q_table_path)
@@ -240,28 +374,47 @@ def run_rl_training(
         flows = json.load(flow_file)
     intersection_specs = _build_intersection_specs(roadnet)
     q_table = _load_q_table(q_table_file_path, intersection_specs)
+    interval = config.get("interval", 1.0)
+    if interval <= 0:
+        raise ValueError("CityFlow interval must be positive.")
+    minimum_green_steps = max(1, math.ceil(minimum_green_duration / interval))
 
     output_file_path.parent.mkdir(parents=True, exist_ok=True)
     q_table_file_path.parent.mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
     print(
         f"Starting Q-Learning for {episodes} episodes "
-        f"with +/-{demand_variation:.0%} traffic-demand variation..."
+        f"with +/-{demand_variation:.0%} demand variation, "
+        f"+/-{vehicle_speed_variation:.0%} vehicle-speed variation, and "
+        f"{breakdown_probability:.0%} breakdown probability "
+        f"(minimum green {minimum_green_duration:g}s)..."
     )
 
     with tempfile.TemporaryDirectory() as temp_dir:
         total_training_steps = episodes * max_steps
         for episode in range(1, episodes + 1):
-            demand_scale = rng.uniform(
-                1 - demand_variation, 1 + demand_variation
+            scenario = _generate_scenario_uncertainties(
+                roadnet,
+                max_steps,
+                rng,
+                demand_variation,
+                vehicle_speed_variation,
+                breakdown_probability,
+                breakdown_duration_steps,
             )
+            demand_scale = scenario["demand_scale"]
             episode_dir = Path(temp_dir) / f"episode_{episode}"
             episode_dir.mkdir()
             shutil.copy2(roadnet_path, episode_dir / "roadnet.json")
             with (episode_dir / "flow.json").open(
                 "w", encoding="utf-8"
             ) as flow_file:
-                json.dump(_scale_flow_demand(flows, demand_scale), flow_file)
+                json.dump(
+                    _scale_flow_demand(
+                        flows, demand_scale, scenario["vehicle_speed_scale"]
+                    ),
+                    flow_file,
+                )
 
             episode_config = dict(config)
             episode_config.update(
@@ -269,7 +422,7 @@ def run_rl_training(
                     "dir": str(episode_dir.resolve()) + os.sep,
                     "roadnetFile": "roadnet.json",
                     "flowFile": "flow.json",
-                    "seed": rng.randrange(0, 2**31),
+                    "seed": scenario["seed"],
                 }
             )
             engine_config_path = episode_dir / "config.json"
@@ -280,8 +433,14 @@ def run_rl_training(
             )
 
             episode_rows = []
+            affected_vehicles = {}
+            active_actions = {}
+            green_elapsed_steps = {}
             lane_waiting_counts = engine.get_lane_waiting_vehicle_count()
             for step in range(1, max_steps + 1):
+                _apply_scenario_incidents(
+                    engine, scenario["incidents"], step, affected_vehicles
+                )
                 current_states = {
                     intersection_id: _queue_state(
                         lane_waiting_counts, intersection_spec
@@ -294,14 +453,32 @@ def run_rl_training(
 
                 selected_actions = {}
                 for intersection_id, intersection_spec in intersection_specs.items():
-                    action = _select_action(
-                        q_table,
-                        intersection_id,
-                        current_states[intersection_id],
-                        intersection_spec["actions"],
-                        epsilon,
-                        rng,
-                    )
+                    if _hold_green_action(
+                        active_actions.get(intersection_id),
+                        green_elapsed_steps.get(intersection_id, 0),
+                        minimum_green_steps,
+                    ):
+                        action = active_actions[intersection_id]
+                    else:
+                        fixed_time_action = _fixed_time_phase(
+                            intersection_spec, step, interval
+                        )
+                        action = _select_action(
+                            q_table,
+                            intersection_id,
+                            current_states[intersection_id],
+                            intersection_spec["actions"],
+                            epsilon,
+                            rng,
+                            fixed_time_action,
+                        )
+                        if action in intersection_spec["actions"]:
+                            if action != active_actions.get(intersection_id):
+                                green_elapsed_steps[intersection_id] = 0
+                            active_actions[intersection_id] = action
+                        else:
+                            active_actions.pop(intersection_id, None)
+                            green_elapsed_steps.pop(intersection_id, None)
                     selected_actions[intersection_id] = action
                     engine.set_tl_phase(intersection_id, action)
 
@@ -309,6 +486,9 @@ def run_rl_training(
                 next_lane_waiting_counts = engine.get_lane_waiting_vehicle_count()
                 terminal = step == max_steps
                 for intersection_id, intersection_spec in intersection_specs.items():
+                    action = selected_actions[intersection_id]
+                    if action not in intersection_spec["actions"]:
+                        continue
                     next_state = _queue_state(
                         next_lane_waiting_counts, intersection_spec
                     )
@@ -319,7 +499,7 @@ def run_rl_training(
                         q_table,
                         intersection_id,
                         current_states[intersection_id],
-                        selected_actions[intersection_id],
+                        action,
                         reward,
                         next_state,
                         intersection_spec["actions"],
@@ -327,6 +507,10 @@ def run_rl_training(
                         discount_factor,
                         terminal,
                     )
+                    if intersection_id in active_actions:
+                        green_elapsed_steps[intersection_id] = (
+                            green_elapsed_steps.get(intersection_id, 0) + 1
+                        )
 
                 lane_waiting_counts = next_lane_waiting_counts
                 episode_rows.append(
@@ -334,6 +518,8 @@ def run_rl_training(
                         "episode": episode,
                         "step": step,
                         "demand_scale": demand_scale,
+                        "vehicle_speed_scale": scenario["vehicle_speed_scale"],
+                        "breakdown_count": len(scenario["incidents"]),
                         "total_queue_length": sum(next_lane_waiting_counts.values()),
                         "average_travel_time": engine.get_average_travel_time(),
                     }

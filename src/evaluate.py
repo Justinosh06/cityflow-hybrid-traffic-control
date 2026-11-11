@@ -1,5 +1,8 @@
 import json
+import math
 import os
+import random
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -34,38 +37,116 @@ def _load_cityflow_config(config_path):
     return config
 
 
-def _run_policy(config, policy_name, intersections, max_steps, thread_num, action_fn):
-    policy_config = dict(config)
-    policy_config["rlTrafficLight"] = action_fn is not None
+def _build_evaluation_scenarios(
+    roadnet,
+    scenario_count,
+    max_steps,
+    demand_variation,
+    vehicle_speed_variation,
+    breakdown_probability,
+    breakdown_duration_steps,
+    seed,
+):
+    if scenario_count <= 0:
+        raise ValueError("scenario_count must be a positive integer.")
+
+    rng = random.Random(seed)
+    return [
+        {
+            "scenario": scenario_index,
+            **train._generate_scenario_uncertainties(
+                roadnet,
+                max_steps,
+                rng,
+                demand_variation,
+                vehicle_speed_variation,
+                breakdown_probability,
+                breakdown_duration_steps,
+            ),
+        }
+        for scenario_index in range(1, scenario_count + 1)
+    ]
+
+
+def _run_policy(
+    config,
+    roadnet_path,
+    flows,
+    scenarios,
+    policy_name,
+    intersections,
+    max_steps,
+    thread_num,
+    action_fn,
+):
     rows = []
     actions_by_step = []
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        engine_config_path = Path(temp_dir) / "config.json"
-        with engine_config_path.open("w", encoding="utf-8") as config_file:
-            json.dump(policy_config, config_file)
+        for scenario in scenarios:
+            scenario_dir = Path(temp_dir) / f"scenario_{scenario['scenario']}"
+            scenario_dir.mkdir()
+            shutil.copy2(roadnet_path, scenario_dir / "roadnet.json")
+            with (scenario_dir / "flow.json").open(
+                "w", encoding="utf-8"
+            ) as flow_file:
+                json.dump(
+                    train._scale_flow_demand(
+                        flows,
+                        scenario["demand_scale"],
+                        scenario["vehicle_speed_scale"],
+                    ),
+                    flow_file,
+                )
 
-        engine = cityflow.Engine(str(engine_config_path), thread_num=thread_num)
-        for step in range(1, max_steps + 1):
-            step_actions = {}
-            if action_fn is not None:
-                action_observations = action_fn(engine)
-                for intersection_id in intersections:
-                    action = action_observations[intersection_id]
-                    engine.set_tl_phase(intersection_id, action)
-                    step_actions[intersection_id] = action
-
-            engine.next_step()
-            lane_waiting_counts = engine.get_lane_waiting_vehicle_count()
-            rows.append(
+            scenario_config = dict(config)
+            scenario_config.update(
                 {
-                    "policy": policy_name,
-                    "step": step,
-                    "total_queue_length": sum(lane_waiting_counts.values()),
-                    "average_travel_time": engine.get_average_travel_time(),
+                    "dir": str(scenario_dir.resolve()) + os.sep,
+                    "roadnetFile": "roadnet.json",
+                    "flowFile": "flow.json",
+                    "seed": scenario["seed"],
+                    "rlTrafficLight": action_fn is not None,
                 }
             )
-            actions_by_step.append(step_actions)
+            engine_config_path = scenario_dir / "config.json"
+            with engine_config_path.open("w", encoding="utf-8") as config_file:
+                json.dump(scenario_config, config_file)
+
+            engine = cityflow.Engine(
+                str(engine_config_path), thread_num=thread_num
+            )
+            affected_vehicles = {}
+            for step in range(1, max_steps + 1):
+                train._apply_scenario_incidents(
+                    engine,
+                    scenario["incidents"],
+                    step,
+                    affected_vehicles,
+                )
+                step_actions = {}
+                if action_fn is not None:
+                    action_observations = action_fn(engine, step)
+                    for intersection_id in intersections:
+                        action = action_observations[intersection_id]
+                        engine.set_tl_phase(intersection_id, action)
+                        step_actions[intersection_id] = action
+
+                engine.next_step()
+                lane_waiting_counts = engine.get_lane_waiting_vehicle_count()
+                rows.append(
+                    {
+                        "policy": policy_name,
+                        "scenario": scenario["scenario"],
+                        "demand_scale": scenario["demand_scale"],
+                        "vehicle_speed_scale": scenario["vehicle_speed_scale"],
+                        "breakdown_count": len(scenario["incidents"]),
+                        "step": step,
+                        "total_queue_length": sum(lane_waiting_counts.values()),
+                        "average_travel_time": engine.get_average_travel_time(),
+                    }
+                )
+                actions_by_step.append(step_actions)
 
     return pd.DataFrame(rows), actions_by_step
 
@@ -99,9 +180,18 @@ def run_evaluation(
     confusion_matrix_csv="data/evaluation_confusion_matrix.csv",
     max_steps=3600,
     thread_num=4,
+    scenario_count=5,
+    demand_variation=0.2,
+    vehicle_speed_variation=0.15,
+    breakdown_probability=0.5,
+    breakdown_duration_steps=60,
+    minimum_green_duration=10.0,
+    seed=0,
 ):
     if max_steps <= 0:
         raise ValueError("max_steps must be a positive integer.")
+    if minimum_green_duration <= 0:
+        raise ValueError("minimum_green_duration must be positive.")
 
     config_file_path = _project_path(config_path)
     model_file_path = _project_path(model_path)
@@ -124,6 +214,19 @@ def run_evaluation(
     roadnet_path = Path(config["dir"]) / config["roadnetFile"]
     with roadnet_path.open("r", encoding="utf-8") as roadnet_file:
         roadnet = json.load(roadnet_file)
+    flow_path = Path(config["dir"]) / config["flowFile"]
+    with flow_path.open("r", encoding="utf-8") as flow_file:
+        flows = json.load(flow_file)
+    scenarios = _build_evaluation_scenarios(
+        roadnet,
+        scenario_count,
+        max_steps,
+        demand_variation,
+        vehicle_speed_variation,
+        breakdown_probability,
+        breakdown_duration_steps,
+        seed,
+    )
     intersection_specs = train._build_intersection_specs(roadnet)
     intersections = list(intersection_specs)
     q_table = train._load_q_table(q_table_file_path, intersection_specs)
@@ -143,7 +246,7 @@ def run_evaluation(
         for action in spec["actions"]
     )
 
-    def rf_action_fn(engine):
+    def rf_action_fn(engine, _step):
         lane_vehicle_counts = engine.get_lane_vehicle_count()
         state = pd.DataFrame(
             [
@@ -157,21 +260,58 @@ def run_evaluation(
         action = int(model.predict(state)[0])
         return {intersection_id: action for intersection_id in intersections}
 
-    def q_learning_action_fn(engine):
+    interval = config.get("interval", 1.0)
+    if interval <= 0:
+        raise ValueError("CityFlow interval must be positive.")
+    minimum_green_steps = max(
+        1, math.ceil(minimum_green_duration / interval)
+    )
+    active_actions = {}
+    green_elapsed_steps = {}
+
+    def q_learning_action_fn(engine, step):
         lane_waiting_counts = engine.get_lane_waiting_vehicle_count()
-        return {
-            intersection_id: train._greedy_action(
-                q_table,
-                intersection_id,
-                train._queue_state(lane_waiting_counts, spec),
-                spec["actions"],
-            )
-            for intersection_id, spec in intersection_specs.items()
-        }
+        selected_actions = {}
+        for intersection_id, spec in intersection_specs.items():
+            if train._hold_green_action(
+                active_actions.get(intersection_id),
+                green_elapsed_steps.get(intersection_id, 0),
+                minimum_green_steps,
+            ):
+                action = active_actions[intersection_id]
+            else:
+                state = train._queue_state(lane_waiting_counts, spec)
+                action = train._greedy_action(
+                    q_table,
+                    intersection_id,
+                    state,
+                    spec["actions"],
+                    train._fixed_time_phase(spec, step, interval),
+                )
+                if action in spec["actions"]:
+                    if action != active_actions.get(intersection_id):
+                        green_elapsed_steps[intersection_id] = 0
+                    active_actions[intersection_id] = action
+                else:
+                    active_actions.pop(intersection_id, None)
+                    green_elapsed_steps.pop(intersection_id, None)
+
+            selected_actions[intersection_id] = action
+            if intersection_id in active_actions:
+                green_elapsed_steps[intersection_id] = (
+                    green_elapsed_steps.get(intersection_id, 0) + 1
+                )
+        return selected_actions
 
     output_file_path.parent.mkdir(parents=True, exist_ok=True)
     confusion_matrix_path.parent.mkdir(parents=True, exist_ok=True)
     policy_results = []
+    print(
+        f"Evaluating all policies on {scenario_count} shared scenarios "
+        f"with +/-{demand_variation:.0%} demand variation, "
+        f"+/-{vehicle_speed_variation:.0%} vehicle-speed variation, and "
+        f"{breakdown_probability:.0%} breakdown probability..."
+    )
     for policy_name, action_fn in (
         ("no_training", None),
         ("pretrained_random_forest", rf_action_fn),
@@ -179,6 +319,9 @@ def run_evaluation(
     ):
         metrics, actions = _run_policy(
             config,
+            roadnet_path,
+            flows,
+            scenarios,
             policy_name,
             intersections,
             max_steps,
@@ -204,12 +347,18 @@ def run_evaluation(
         ("no_training", "pretrained_random_forest", "q_learning"),
         policy_results,
     ):
-        final_average_travel_time = metrics["average_travel_time"].iloc[-1]
-        peak_queue_length = metrics["total_queue_length"].max()
+        scenario_results = metrics.groupby("scenario").agg(
+            final_average_travel_time=("average_travel_time", "last"),
+            peak_queue_length=("total_queue_length", "max"),
+        )
+        final_average_travel_time = scenario_results[
+            "final_average_travel_time"
+        ].mean()
+        peak_queue_length = scenario_results["peak_queue_length"].mean()
         print(
-            f"  {policy_name}: final average travel time "
-            f"{final_average_travel_time:.2f} seconds, "
-            f"peak queue length {peak_queue_length}"
+            f"  {policy_name}: mean final average travel time "
+            f"{final_average_travel_time:.2f} seconds across scenarios, "
+            f"mean peak queue length {peak_queue_length:.2f}"
         )
     print(
         "Confusion matrix (rows: RF actions, columns: Q-learning actions) "
