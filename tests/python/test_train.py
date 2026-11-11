@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import joblib
 
+from src import evaluate
 from src import train
 
 
@@ -131,6 +132,7 @@ class TestQLearningTraining(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            (root / "flow.json").write_text("[]", encoding="utf-8")
             q_table_path = root / "q_table.joblib"
             metrics_path = root / "metrics.csv"
             engine = FakeEngine()
@@ -154,6 +156,31 @@ class TestQLearningTraining(unittest.TestCase):
             self.assertTrue(saved_table["q_table"])
             self.assertTrue(engine.actions)
             self.assertTrue(all(phase in (0, 2) for _, phase in engine.actions))
+
+    def test_demand_scaling_changes_vehicle_arrival_interval(self):
+        scaled = train._scale_flow_demand(
+            [{"interval": 5, "route": ["road_a", "road_b"]}],
+            demand_scale=1.25,
+        )
+
+        self.assertEqual(scaled[0]["interval"], 4)
+
+    def test_confusion_matrix_compares_q_actions_to_rf_actions(self):
+        rf_actions = [{"junction": 0}, {"junction": 2}, {"junction": 0}]
+        q_actions = [{"junction": 2}, {"junction": 2}, {"junction": 0}]
+
+        matrix = evaluate._build_action_confusion_matrix(
+            rf_actions,
+            q_actions,
+            ["junction"],
+            known_actions={0, 1, 2, 3},
+        )
+
+        self.assertEqual(list(matrix.index), [0, 1, 2, 3])
+        self.assertEqual(matrix.loc[0, 0], 1)
+        self.assertEqual(matrix.loc[0, 2], 1)
+        self.assertEqual(matrix.loc[2, 2], 1)
+        self.assertEqual(int(matrix.to_numpy().sum()), 3)
 
 
 if __name__ == "__main__":

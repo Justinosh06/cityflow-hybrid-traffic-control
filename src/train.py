@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import shutil
 import tempfile
 from bisect import bisect_right
 from pathlib import Path
@@ -129,6 +130,11 @@ def _select_action(q_table, intersection_id, state, actions, epsilon, rng):
     return rng.choice(best_actions)
 
 
+def _greedy_action(q_table, intersection_id, state, actions):
+    state_values = q_table.get(intersection_id, {}).get(state, {})
+    return max(actions, key=lambda action: state_values.get(action, 0.0))
+
+
 def _update_q_value(
     q_table,
     intersection_id,
@@ -180,6 +186,16 @@ def _load_q_table(q_table_path, intersection_specs):
     return payload["q_table"]
 
 
+def _scale_flow_demand(flows, demand_scale):
+    scaled_flows = json.loads(json.dumps(flows))
+    for flow in scaled_flows:
+        interval = flow.get("interval")
+        if not isinstance(interval, (int, float)) or interval <= 0:
+            raise ValueError("Every traffic flow must have a positive interval.")
+        flow["interval"] = interval / demand_scale
+    return scaled_flows
+
+
 def run_rl_training(
     config_path="data/config.json",
     q_table_path="models/q_table.joblib",
@@ -191,6 +207,7 @@ def run_rl_training(
     discount_factor=0.95,
     epsilon_start=1.0,
     epsilon_end=0.05,
+    demand_variation=0.2,
     seed=0,
 ):
     if episodes <= 0:
@@ -205,6 +222,8 @@ def run_rl_training(
         raise ValueError(
             "epsilon values must satisfy 0 <= epsilon_end <= epsilon_start <= 1."
         )
+    if not 0 <= demand_variation < 1:
+        raise ValueError("demand_variation must be in the range [0, 1).")
 
     config_file_path = _project_path(config_path)
     q_table_file_path = _project_path(q_table_path)
@@ -216,24 +235,49 @@ def run_rl_training(
     roadnet_path = Path(config["dir"]) / config["roadnetFile"]
     with roadnet_path.open("r", encoding="utf-8") as roadnet_file:
         roadnet = json.load(roadnet_file)
+    flow_path = Path(config["dir"]) / config["flowFile"]
+    with flow_path.open("r", encoding="utf-8") as flow_file:
+        flows = json.load(flow_file)
     intersection_specs = _build_intersection_specs(roadnet)
     q_table = _load_q_table(q_table_file_path, intersection_specs)
 
     output_file_path.parent.mkdir(parents=True, exist_ok=True)
     q_table_file_path.parent.mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
-    print(f"Starting Q-Learning for {episodes} episodes...")
+    print(
+        f"Starting Q-Learning for {episodes} episodes "
+        f"with +/-{demand_variation:.0%} traffic-demand variation..."
+    )
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        engine_config_path = Path(temp_dir) / "config.json"
-        with engine_config_path.open("w", encoding="utf-8") as config_file:
-            json.dump(config, config_file)
-
-        engine = cityflow.Engine(str(engine_config_path), thread_num=thread_num)
         total_training_steps = episodes * max_steps
         for episode in range(1, episodes + 1):
-            if episode > 1:
-                engine.reset()
+            demand_scale = rng.uniform(
+                1 - demand_variation, 1 + demand_variation
+            )
+            episode_dir = Path(temp_dir) / f"episode_{episode}"
+            episode_dir.mkdir()
+            shutil.copy2(roadnet_path, episode_dir / "roadnet.json")
+            with (episode_dir / "flow.json").open(
+                "w", encoding="utf-8"
+            ) as flow_file:
+                json.dump(_scale_flow_demand(flows, demand_scale), flow_file)
+
+            episode_config = dict(config)
+            episode_config.update(
+                {
+                    "dir": str(episode_dir.resolve()) + os.sep,
+                    "roadnetFile": "roadnet.json",
+                    "flowFile": "flow.json",
+                    "seed": rng.randrange(0, 2**31),
+                }
+            )
+            engine_config_path = episode_dir / "config.json"
+            with engine_config_path.open("w", encoding="utf-8") as config_file:
+                json.dump(episode_config, config_file)
+            engine = cityflow.Engine(
+                str(engine_config_path), thread_num=thread_num
+            )
 
             episode_rows = []
             lane_waiting_counts = engine.get_lane_waiting_vehicle_count()
@@ -289,6 +333,7 @@ def run_rl_training(
                     {
                         "episode": episode,
                         "step": step,
+                        "demand_scale": demand_scale,
                         "total_queue_length": sum(next_lane_waiting_counts.values()),
                         "average_travel_time": engine.get_average_travel_time(),
                     }
