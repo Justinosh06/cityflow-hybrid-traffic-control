@@ -321,7 +321,7 @@ def _apply_scenario_incidents(engine, incidents, step, affected_vehicles):
 def run_rl_training(
     config_path="data/config.json",
     q_table_path="models/q_table.joblib",
-    episodes=100,
+    episodes=500,
     max_steps=3600,
     output_csv="data/training_metrics.csv",
     thread_num=4,

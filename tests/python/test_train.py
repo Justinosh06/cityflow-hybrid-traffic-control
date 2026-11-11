@@ -147,10 +147,10 @@ class TestQLearningTraining(unittest.TestCase):
         self.assertFalse(train._hold_green_action(2, 5, 5))
         self.assertFalse(train._hold_green_action(None, 0, 5))
 
-    def test_training_defaults_to_100_episodes(self):
+    def test_training_defaults_to_500_episodes(self):
         self.assertEqual(
             inspect.signature(train.run_rl_training).parameters["episodes"].default,
-            100,
+            500,
         )
 
     def test_training_updates_and_saves_q_table_without_rf_model(self):
