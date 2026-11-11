@@ -126,7 +126,7 @@ def _run_policy(
                 )
                 step_actions = {}
                 if action_fn is not None:
-                    action_observations = action_fn(engine, step)
+                    action_observations = action_fn(engine, step, scenario)
                     for intersection_id in intersections:
                         action = action_observations[intersection_id]
                         engine.set_tl_phase(intersection_id, action)
@@ -186,12 +186,18 @@ def run_evaluation(
     breakdown_probability=0.5,
     breakdown_duration_steps=60,
     minimum_green_duration=10.0,
+    decision_interval=10.0,
+    maximum_red_time=80.0,
     seed=0,
 ):
     if max_steps <= 0:
         raise ValueError("max_steps must be a positive integer.")
     if minimum_green_duration <= 0:
         raise ValueError("minimum_green_duration must be positive.")
+    if decision_interval <= 0:
+        raise ValueError("decision_interval must be positive.")
+    if maximum_red_time <= 0:
+        raise ValueError("maximum_red_time must be positive.")
 
     config_file_path = _project_path(config_path)
     model_file_path = _project_path(model_path)
@@ -246,7 +252,7 @@ def run_evaluation(
         for action in spec["actions"]
     )
 
-    def rf_action_fn(engine, _step):
+    def rf_action_fn(engine, _step, _scenario):
         lane_vehicle_counts = engine.get_lane_vehicle_count()
         state = pd.DataFrame(
             [
@@ -266,41 +272,73 @@ def run_evaluation(
     minimum_green_steps = max(
         1, math.ceil(minimum_green_duration / interval)
     )
-    active_actions = {}
-    green_elapsed_steps = {}
+    decision_steps = max(1, math.ceil(decision_interval / interval))
+    controller_state = {}
+    controller_rng = random.Random(seed)
 
-    def q_learning_action_fn(engine, step):
+    def q_learning_action_fn(engine, step, scenario):
+        if controller_state.get("scenario") != scenario["scenario"]:
+            controller_state.clear()
+            controller_state.update(
+                {
+                    "scenario": scenario["scenario"],
+                    "active_actions": {},
+                    "green_elapsed_steps": {},
+                    "last_green_steps": {
+                        intersection_id: {
+                            action: 0 for action in spec["actions"]
+                        }
+                        for intersection_id, spec in intersection_specs.items()
+                    },
+                    "waiting_durations": {},
+                }
+            )
+
+        active_actions = controller_state["active_actions"]
+        green_elapsed_steps = controller_state["green_elapsed_steps"]
+        last_green_steps = controller_state["last_green_steps"]
+        waiting_durations = controller_state["waiting_durations"]
+        train._update_waiting_durations(engine, waiting_durations, interval)
         lane_waiting_counts = engine.get_lane_waiting_vehicle_count()
         selected_actions = {}
         for intersection_id, spec in intersection_specs.items():
-            if train._hold_green_action(
-                active_actions.get(intersection_id),
-                green_elapsed_steps.get(intersection_id, 0),
-                minimum_green_steps,
-            ):
-                action = active_actions[intersection_id]
-            else:
-                state = train._queue_state(lane_waiting_counts, spec)
-                action = train._greedy_action(
+            if (step - 1) % decision_steps == 0:
+                red_times = train._red_times_at_step(
+                    step,
+                    last_green_steps[intersection_id],
+                    spec["actions"],
+                    interval,
+                )
+                state = train._queue_state(
+                    lane_waiting_counts, spec, red_times
+                )
+                action = train._choose_control_action(
                     q_table,
                     intersection_id,
                     state,
-                    spec["actions"],
-                    train._fixed_time_phase(spec, step, interval),
+                    spec,
+                    step,
+                    interval,
+                    red_times,
+                    active_actions.get(intersection_id),
+                    green_elapsed_steps.get(intersection_id, 0),
+                    minimum_green_steps,
+                    maximum_red_time,
+                    0.0,
+                    controller_rng,
                 )
-                if action in spec["actions"]:
-                    if action != active_actions.get(intersection_id):
-                        green_elapsed_steps[intersection_id] = 0
-                    active_actions[intersection_id] = action
-                else:
-                    active_actions.pop(intersection_id, None)
-                    green_elapsed_steps.pop(intersection_id, None)
-
+            else:
+                action = active_actions[intersection_id]
             selected_actions[intersection_id] = action
-            if intersection_id in active_actions:
-                green_elapsed_steps[intersection_id] = (
-                    green_elapsed_steps.get(intersection_id, 0) + 1
-                )
+            train._update_phase_timing(
+                intersection_id,
+                action,
+                spec["actions"],
+                step,
+                active_actions,
+                green_elapsed_steps,
+                last_green_steps,
+            )
         return selected_actions
 
     output_file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -310,7 +348,9 @@ def run_evaluation(
         f"Evaluating all policies on {scenario_count} shared scenarios "
         f"with +/-{demand_variation:.0%} demand variation, "
         f"+/-{vehicle_speed_variation:.0%} vehicle-speed variation, and "
-        f"{breakdown_probability:.0%} breakdown probability..."
+        f"{breakdown_probability:.0%} breakdown probability "
+        f"(Q decisions every {decision_steps * interval:g}s, "
+        f"maximum red {maximum_red_time:g}s)..."
     )
     for policy_name, action_fn in (
         ("no_training", None),

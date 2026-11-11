@@ -37,6 +37,9 @@ class FakeEngine:
     def get_lane_vehicles(self):
         return self.lane_vehicles
 
+    def get_vehicle_speed(self):
+        return {}
+
     def set_vehicle_speed(self, vehicle_id, speed):
         self.broken_down_vehicles.append((vehicle_id, speed))
 
@@ -78,6 +81,13 @@ class TestQLearningTraining(unittest.TestCase):
             train._fixed_time_phase(specs["junction"], step=1, interval=1),
             0,
         )
+        state = train._queue_state(
+            {"north_0": 81},
+            specs["junction"],
+            {0: 100, 2: 0},
+        )
+        self.assertEqual(state[-2:], (6, 1))
+        self.assertGreater(state[0], 5)
 
     def test_q_learning_applies_bellman_update(self):
         q_table = {
@@ -153,6 +163,42 @@ class TestQLearningTraining(unittest.TestCase):
             500,
         )
 
+    def test_longest_red_phase_is_forced_when_due(self):
+        spec = {
+            "actions": (0, 2),
+            "fixed_time_schedule": ((0, 30), (2, 30)),
+        }
+        action = train._choose_control_action(
+            q_table={"junction": {(0, 0, 0, 0): {0: 100.0, 2: -100.0}}},
+            intersection_id="junction",
+            state=(0, 0, 0, 0),
+            intersection_spec=spec,
+            step=81,
+            interval=1,
+            red_times={0: 20, 2: 80},
+            active_action=0,
+            green_elapsed_steps=20,
+            minimum_green_steps=10,
+            maximum_red_time=80,
+            epsilon=0,
+            rng=random.Random(1),
+        )
+
+        self.assertEqual(action, 2)
+
+    def test_reward_penalizes_longest_wait_as_well_as_queue(self):
+        reward = train._intersection_reward(
+            lane_waiting_counts={"north_0": 2},
+            lane_vehicles={"north_0": ["car_1", "car_2"]},
+            waiting_durations={"car_1": 40.0, "car_2": 10.0},
+            intersection_spec={
+                "incoming_lanes": ("north_0",),
+            },
+            longest_wait_weight=0.1,
+        )
+
+        self.assertEqual(reward, -6.0)
+
     def test_training_updates_and_saves_q_table_without_rf_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -201,15 +247,31 @@ class TestQLearningTraining(unittest.TestCase):
             q_table_path = root / "q_table.joblib"
             metrics_path = root / "metrics.csv"
             engine = FakeEngine()
+            joblib.dump(
+                {
+                    "format_version": train.Q_TABLE_FORMAT_VERSION,
+                    "actions": {"junction": [0, 2]},
+                    "q_table": {"junction": {(99, 99): {0: -100.0}}},
+                },
+                q_table_path,
+            )
 
-            with patch.object(train.cityflow, "Engine", return_value=engine):
+            with (
+                patch.object(train.cityflow, "Engine", return_value=engine),
+                patch.object(
+                    train,
+                    "_update_q_value",
+                    wraps=train._update_q_value,
+                ) as q_update,
+            ):
                 q_table = train.run_rl_training(
                     config_path=config_path,
                     q_table_path=q_table_path,
                     output_csv=metrics_path,
                     episodes=1,
-                    max_steps=2,
+                    max_steps=22,
                     minimum_green_duration=2,
+                    decision_interval=10,
                     epsilon_start=1,
                     epsilon_end=1,
                     seed=7,
@@ -217,9 +279,14 @@ class TestQLearningTraining(unittest.TestCase):
 
             self.assertTrue(q_table)
             self.assertTrue(metrics_path.is_file())
+            self.assertEqual(q_update.call_count, 3)
             saved_table = joblib.load(q_table_path)
-            self.assertEqual(saved_table["format_version"], 1)
+            self.assertEqual(saved_table["format_version"], 2)
+            self.assertEqual(
+                saved_table["training_settings"]["decision_steps"], 10
+            )
             self.assertTrue(saved_table["q_table"])
+            self.assertNotIn((99, 99), saved_table["q_table"]["junction"])
             self.assertTrue(engine.actions)
             self.assertTrue(all(phase in (0, 2) for _, phase in engine.actions))
             self.assertEqual(engine.actions[:2], [("junction", 0)] * 2)
@@ -356,7 +423,7 @@ class TestQLearningTraining(unittest.TestCase):
                 )
                 return engine
 
-            action_fn = lambda _engine, _step: {"junction": 0}
+            action_fn = lambda _engine, _step, _scenario: {"junction": 0}
             with patch.object(
                 evaluate.cityflow, "Engine", side_effect=create_engine
             ):

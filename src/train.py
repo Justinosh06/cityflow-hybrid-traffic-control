@@ -13,8 +13,9 @@ import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-QUEUE_THRESHOLDS = (0, 2, 5, 10, 20)
-Q_TABLE_FORMAT_VERSION = 1
+QUEUE_THRESHOLDS = (0, 2, 5, 10, 20, 40, 80)
+RED_TIME_THRESHOLDS_SECONDS = (0, 10, 20, 40, 60, 90)
+Q_TABLE_FORMAT_VERSION = 2
 
 
 def _project_path(path):
@@ -102,14 +103,22 @@ def _build_intersection_specs(roadnet):
     return specs
 
 
-def _queue_state(lane_waiting_counts, intersection_spec):
-    return tuple(
+def _queue_state(lane_waiting_counts, intersection_spec, red_times=None):
+    queue_levels = tuple(
         bisect_right(
             QUEUE_THRESHOLDS,
             sum(lane_waiting_counts.get(lane_id, 0) for lane_id in lane_ids),
         )
         for lane_ids in intersection_spec["phase_lanes"].values()
     )
+    red_time_levels = tuple(
+        bisect_right(
+            RED_TIME_THRESHOLDS_SECONDS,
+            (red_times or {}).get(action, 0.0),
+        )
+        for action in intersection_spec["actions"]
+    )
+    return queue_levels + red_time_levels
 
 
 def _intersection_queue(lane_waiting_counts, intersection_spec):
@@ -168,6 +177,105 @@ def _greedy_action(
     )
 
 
+def _red_times_at_step(step, last_green_steps, actions, interval):
+    return {
+        action: max(0, step - last_green_steps.get(action, 0)) * interval
+        for action in actions
+    }
+
+
+def _choose_control_action(
+    q_table,
+    intersection_id,
+    state,
+    intersection_spec,
+    step,
+    interval,
+    red_times,
+    active_action,
+    green_elapsed_steps,
+    minimum_green_steps,
+    maximum_red_time,
+    epsilon,
+    rng,
+):
+    if _hold_green_action(
+        active_action,
+        green_elapsed_steps,
+        minimum_green_steps,
+        intersection_spec["actions"],
+    ):
+        return active_action
+
+    overdue_actions = [
+        action
+        for action in intersection_spec["actions"]
+        if red_times[action] >= maximum_red_time
+    ]
+    if overdue_actions:
+        return max(overdue_actions, key=lambda action: red_times[action])
+
+    return _select_action(
+        q_table,
+        intersection_id,
+        state,
+        intersection_spec["actions"],
+        epsilon,
+        rng,
+        _fixed_time_phase(intersection_spec, step, interval),
+    )
+
+
+def _update_phase_timing(
+    intersection_id,
+    action,
+    actions,
+    step,
+    active_actions,
+    green_elapsed_steps,
+    last_green_steps,
+):
+    if action != active_actions.get(intersection_id):
+        green_elapsed_steps[intersection_id] = 0
+    active_actions[intersection_id] = action
+    if action in actions:
+        last_green_steps[intersection_id][action] = step
+    green_elapsed_steps[intersection_id] += 1
+
+
+def _update_waiting_durations(engine, waiting_durations, interval):
+    vehicle_speeds = engine.get_vehicle_speed()
+    for vehicle_id in list(waiting_durations):
+        if vehicle_id not in vehicle_speeds:
+            waiting_durations.pop(vehicle_id)
+    for vehicle_id, speed in vehicle_speeds.items():
+        if speed < 0.1:
+            waiting_durations[vehicle_id] = (
+                waiting_durations.get(vehicle_id, 0.0) + interval
+            )
+        else:
+            waiting_durations.pop(vehicle_id, None)
+
+
+def _intersection_reward(
+    lane_waiting_counts,
+    lane_vehicles,
+    waiting_durations,
+    intersection_spec,
+    longest_wait_weight,
+):
+    queue_length = _intersection_queue(lane_waiting_counts, intersection_spec)
+    longest_wait = max(
+        (
+            waiting_durations.get(vehicle_id, 0.0)
+            for lane_id in intersection_spec["incoming_lanes"]
+            for vehicle_id in lane_vehicles.get(lane_id, ())
+        ),
+        default=0.0,
+    )
+    return -(queue_length + longest_wait_weight * longest_wait)
+
+
 def _update_q_value(
     q_table,
     intersection_id,
@@ -194,11 +302,19 @@ def _update_q_value(
     )
 
 
-def _hold_green_action(active_action, elapsed_steps, minimum_green_steps):
-    return active_action is not None and elapsed_steps < minimum_green_steps
+def _hold_green_action(
+    active_action, elapsed_steps, minimum_green_steps, green_actions=None
+):
+    return (
+        active_action is not None
+        and (green_actions is None or active_action in green_actions)
+        and elapsed_steps < minimum_green_steps
+    )
 
 
-def _load_q_table(q_table_path, intersection_specs):
+def _load_q_table(
+    q_table_path, intersection_specs, expected_training_settings=None
+):
     if not q_table_path.is_file():
         return {}
 
@@ -219,6 +335,14 @@ def _load_q_table(q_table_path, intersection_specs):
         raise ValueError(
             "The saved Q-table's intersection phases do not match the current "
             "roadnet. Choose a new q_table_path to start fresh."
+        )
+    if (
+        expected_training_settings is not None
+        and payload.get("training_settings") != expected_training_settings
+    ):
+        raise ValueError(
+            "The saved Q-table was trained with different state, reward, or "
+            "timing settings. Start fresh with resume=False."
         )
     return payload["q_table"]
 
@@ -326,6 +450,8 @@ def run_rl_training(
     output_csv="data/training_metrics.csv",
     thread_num=4,
     minimum_green_duration=10.0,
+    decision_interval=10.0,
+    maximum_red_time=80.0,
     learning_rate=0.1,
     discount_factor=0.95,
     epsilon_start=1.0,
@@ -334,6 +460,8 @@ def run_rl_training(
     vehicle_speed_variation=0.15,
     breakdown_probability=0.5,
     breakdown_duration_steps=60,
+    longest_wait_weight=0.1,
+    resume=False,
     seed=0,
 ):
     if episodes <= 0:
@@ -342,6 +470,12 @@ def run_rl_training(
         raise ValueError("max_steps must be a positive integer.")
     if minimum_green_duration <= 0:
         raise ValueError("minimum_green_duration must be positive.")
+    if decision_interval <= 0:
+        raise ValueError("decision_interval must be positive.")
+    if maximum_red_time <= 0:
+        raise ValueError("maximum_red_time must be positive.")
+    if longest_wait_weight < 0:
+        raise ValueError("longest_wait_weight cannot be negative.")
     if not 0 < learning_rate <= 1:
         raise ValueError("learning_rate must be in the range (0, 1].")
     if not 0 <= discount_factor <= 1:
@@ -373,11 +507,25 @@ def run_rl_training(
     with flow_path.open("r", encoding="utf-8") as flow_file:
         flows = json.load(flow_file)
     intersection_specs = _build_intersection_specs(roadnet)
-    q_table = _load_q_table(q_table_file_path, intersection_specs)
+    q_table = {}
     interval = config.get("interval", 1.0)
     if interval <= 0:
         raise ValueError("CityFlow interval must be positive.")
     minimum_green_steps = max(1, math.ceil(minimum_green_duration / interval))
+    decision_steps = max(1, math.ceil(decision_interval / interval))
+    training_settings = {
+        "decision_steps": decision_steps,
+        "maximum_red_time": maximum_red_time,
+        "minimum_green_steps": minimum_green_steps,
+        "longest_wait_weight": longest_wait_weight,
+        "queue_thresholds": QUEUE_THRESHOLDS,
+        "red_time_thresholds_seconds": RED_TIME_THRESHOLDS_SECONDS,
+        "reward": "negative_queue_plus_weighted_longest_wait",
+    }
+    if resume:
+        q_table = _load_q_table(
+            q_table_file_path, intersection_specs, training_settings
+        )
 
     output_file_path.parent.mkdir(parents=True, exist_ok=True)
     q_table_file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -387,11 +535,14 @@ def run_rl_training(
         f"with +/-{demand_variation:.0%} demand variation, "
         f"+/-{vehicle_speed_variation:.0%} vehicle-speed variation, and "
         f"{breakdown_probability:.0%} breakdown probability "
-        f"(minimum green {minimum_green_duration:g}s)..."
+        f"(decisions every {decision_steps * interval:g}s, "
+        f"minimum green {minimum_green_duration:g}s, "
+        f"maximum red {maximum_red_time:g}s)..."
     )
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        total_training_steps = episodes * max_steps
+        total_decisions = episodes * math.ceil(max_steps / decision_steps)
+        decision_count = 0
         for episode in range(1, episodes + 1):
             scenario = _generate_scenario_uncertainties(
                 roadnet,
@@ -436,81 +587,116 @@ def run_rl_training(
             affected_vehicles = {}
             active_actions = {}
             green_elapsed_steps = {}
+            last_green_steps = {
+                intersection_id: {action: 0 for action in spec["actions"]}
+                for intersection_id, spec in intersection_specs.items()
+            }
+            waiting_durations = {}
+            decision_states = {}
+            decision_actions = {}
+            decision_rewards = {
+                intersection_id: 0.0 for intersection_id in intersection_specs
+            }
             lane_waiting_counts = engine.get_lane_waiting_vehicle_count()
             for step in range(1, max_steps + 1):
                 _apply_scenario_incidents(
                     engine, scenario["incidents"], step, affected_vehicles
                 )
-                current_states = {
-                    intersection_id: _queue_state(
-                        lane_waiting_counts, intersection_spec
+                is_decision_step = (step - 1) % decision_steps == 0
+                if is_decision_step:
+                    progress = decision_count / max(total_decisions - 1, 1)
+                    epsilon = epsilon_start + progress * (
+                        epsilon_end - epsilon_start
                     )
-                    for intersection_id, intersection_spec in intersection_specs.items()
-                }
-                elapsed_steps = (episode - 1) * max_steps + step - 1
-                progress = elapsed_steps / max(total_training_steps - 1, 1)
-                epsilon = epsilon_start + progress * (epsilon_end - epsilon_start)
-
-                selected_actions = {}
-                for intersection_id, intersection_spec in intersection_specs.items():
-                    if _hold_green_action(
-                        active_actions.get(intersection_id),
-                        green_elapsed_steps.get(intersection_id, 0),
-                        minimum_green_steps,
-                    ):
-                        action = active_actions[intersection_id]
-                    else:
-                        fixed_time_action = _fixed_time_phase(
-                            intersection_spec, step, interval
+                    decision_count += 1
+                    for intersection_id, spec in intersection_specs.items():
+                        red_times = _red_times_at_step(
+                            step,
+                            last_green_steps[intersection_id],
+                            spec["actions"],
+                            interval,
                         )
-                        action = _select_action(
+                        state = _queue_state(
+                            lane_waiting_counts, spec, red_times
+                        )
+                        decision_states[intersection_id] = state
+                        decision_rewards[intersection_id] = 0.0
+                        action = _choose_control_action(
                             q_table,
                             intersection_id,
-                            current_states[intersection_id],
-                            intersection_spec["actions"],
+                            state,
+                            spec,
+                            step,
+                            interval,
+                            red_times,
+                            active_actions.get(intersection_id),
+                            green_elapsed_steps.get(intersection_id, 0),
+                            minimum_green_steps,
+                            maximum_red_time,
                             epsilon,
                             rng,
-                            fixed_time_action,
                         )
-                        if action in intersection_spec["actions"]:
-                            if action != active_actions.get(intersection_id):
-                                green_elapsed_steps[intersection_id] = 0
-                            active_actions[intersection_id] = action
-                        else:
-                            active_actions.pop(intersection_id, None)
-                            green_elapsed_steps.pop(intersection_id, None)
-                    selected_actions[intersection_id] = action
+                        decision_actions[intersection_id] = action
+                        _update_phase_timing(
+                            intersection_id,
+                            action,
+                            spec["actions"],
+                            step,
+                            active_actions,
+                            green_elapsed_steps,
+                            last_green_steps,
+                        )
+
+                selected_actions = active_actions
+                for intersection_id, action in selected_actions.items():
                     engine.set_tl_phase(intersection_id, action)
 
                 engine.next_step()
                 next_lane_waiting_counts = engine.get_lane_waiting_vehicle_count()
+                _update_waiting_durations(engine, waiting_durations, interval)
+                lane_vehicles = engine.get_lane_vehicles()
+                for intersection_id, spec in intersection_specs.items():
+                    decision_rewards[intersection_id] += _intersection_reward(
+                        next_lane_waiting_counts,
+                        lane_vehicles,
+                        waiting_durations,
+                        spec,
+                        longest_wait_weight,
+                    )
+                    if not is_decision_step:
+                        action = active_actions[intersection_id]
+                        if action in spec["actions"]:
+                            last_green_steps[intersection_id][action] = step
+                        green_elapsed_steps[intersection_id] += 1
+
                 terminal = step == max_steps
-                for intersection_id, intersection_spec in intersection_specs.items():
-                    action = selected_actions[intersection_id]
-                    if action not in intersection_spec["actions"]:
-                        continue
-                    next_state = _queue_state(
-                        next_lane_waiting_counts, intersection_spec
-                    )
-                    reward = -_intersection_queue(
-                        next_lane_waiting_counts, intersection_spec
-                    )
-                    _update_q_value(
-                        q_table,
-                        intersection_id,
-                        current_states[intersection_id],
-                        action,
-                        reward,
-                        next_state,
-                        intersection_spec["actions"],
-                        learning_rate,
-                        discount_factor,
-                        terminal,
-                    )
-                    if intersection_id in active_actions:
-                        green_elapsed_steps[intersection_id] = (
-                            green_elapsed_steps.get(intersection_id, 0) + 1
-                        )
+                if step % decision_steps == 0 or terminal:
+                    for intersection_id, spec in intersection_specs.items():
+                        action = decision_actions[intersection_id]
+                        if action in spec["actions"]:
+                            next_red_times = _red_times_at_step(
+                                step + 1,
+                                last_green_steps[intersection_id],
+                                spec["actions"],
+                                interval,
+                            )
+                            next_state = _queue_state(
+                                next_lane_waiting_counts,
+                                spec,
+                                next_red_times,
+                            )
+                            _update_q_value(
+                                q_table,
+                                intersection_id,
+                                decision_states[intersection_id],
+                                action,
+                                decision_rewards[intersection_id],
+                                next_state,
+                                spec["actions"],
+                                learning_rate,
+                                discount_factor,
+                                terminal,
+                            )
 
                 lane_waiting_counts = next_lane_waiting_counts
                 episode_rows.append(
@@ -545,6 +731,7 @@ def run_rl_training(
     joblib.dump(
         {
             "format_version": Q_TABLE_FORMAT_VERSION,
+            "training_settings": training_settings,
             "actions": {
                 intersection_id: list(spec["actions"])
                 for intersection_id, spec in intersection_specs.items()
