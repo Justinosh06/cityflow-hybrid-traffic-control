@@ -235,7 +235,6 @@ def run_evaluation(
     )
     intersection_specs = train._build_intersection_specs(roadnet)
     intersections = list(intersection_specs)
-    q_table = train._load_q_table(q_table_file_path, intersection_specs)
 
     model = joblib.load(model_file_path)
     expected_features = getattr(model, "feature_names_in_", None)
@@ -273,6 +272,18 @@ def run_evaluation(
         1, math.ceil(minimum_green_duration / interval)
     )
     decision_steps = max(1, math.ceil(decision_interval / interval))
+    expected_training_settings = train._build_training_settings(
+        interval,
+        minimum_green_duration,
+        decision_interval,
+        maximum_red_time,
+        longest_wait_weight=0.1,
+    )
+    q_table = train._load_q_table(
+        q_table_file_path,
+        intersection_specs,
+        expected_training_settings,
+    )
     controller_state = {}
     controller_rng = random.Random(seed)
 
@@ -310,7 +321,10 @@ def run_evaluation(
                     interval,
                 )
                 state = train._queue_state(
-                    lane_waiting_counts, spec, red_times
+                    lane_waiting_counts,
+                    spec,
+                    red_times,
+                    active_actions.get(intersection_id),
                 )
                 action = train._choose_control_action(
                     q_table,

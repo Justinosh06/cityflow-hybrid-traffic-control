@@ -14,7 +14,7 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 QUEUE_THRESHOLDS = (2, 5, 10, 20, 40, 80)
-Q_TABLE_FORMAT_VERSION = 3
+Q_TABLE_FORMAT_VERSION = 4
 
 
 def _project_path(path):
@@ -102,14 +102,42 @@ def _build_intersection_specs(roadnet):
     return specs
 
 
-def _queue_state(lane_waiting_counts, intersection_spec, red_times=None):
-    return tuple(
+def _queue_state(
+    lane_waiting_counts, intersection_spec, red_times=None, active_action=None
+):
+    queue_levels = tuple(
         bisect_right(
             QUEUE_THRESHOLDS,
             sum(lane_waiting_counts.get(lane_id, 0) for lane_id in lane_ids),
         )
         for lane_ids in intersection_spec["phase_lanes"].values()
     )
+    actions = intersection_spec["actions"]
+    current_action_index = (
+        actions.index(active_action) if active_action in actions else -1
+    )
+    return (*queue_levels, current_action_index)
+
+
+def _build_training_settings(
+    interval,
+    minimum_green_duration,
+    decision_interval,
+    maximum_red_time,
+    longest_wait_weight,
+):
+    return {
+        "decision_steps": max(1, math.ceil(decision_interval / interval)),
+        "maximum_red_time": maximum_red_time,
+        "minimum_green_steps": max(
+            1, math.ceil(minimum_green_duration / interval)
+        ),
+        "longest_wait_weight": longest_wait_weight,
+        "queue_thresholds": QUEUE_THRESHOLDS,
+        "red_time_thresholds_seconds": None,
+        "reward": "negative_queue_plus_weighted_longest_wait",
+        "state_representation": "queue_levels_plus_current_green_action",
+    }
 
 
 def _intersection_queue(lane_waiting_counts, intersection_spec):
@@ -141,7 +169,10 @@ def _select_action(
 ):
     state_values = q_table.get(intersection_id, {}).get(state)
     if not state_values:
-        return actions[max(range(len(actions)), key=lambda index: state[index])]
+        queue_levels = state[: len(actions)]
+        return actions[
+            max(range(len(actions)), key=lambda index: queue_levels[index])
+        ]
 
     if rng.random() < epsilon:
         return rng.choice(actions)
@@ -160,7 +191,10 @@ def _greedy_action(
 ):
     state_values = q_table.get(intersection_id, {}).get(state)
     if not state_values:
-        return actions[max(range(len(actions)), key=lambda index: state[index])]
+        queue_levels = state[: len(actions)]
+        return actions[
+            max(range(len(actions)), key=lambda index: queue_levels[index])
+        ]
 
     return max(
         actions,
@@ -504,15 +538,13 @@ def run_rl_training(
         raise ValueError("CityFlow interval must be positive.")
     minimum_green_steps = max(1, math.ceil(minimum_green_duration / interval))
     decision_steps = max(1, math.ceil(decision_interval / interval))
-    training_settings = {
-        "decision_steps": decision_steps,
-        "maximum_red_time": maximum_red_time,
-        "minimum_green_steps": minimum_green_steps,
-        "longest_wait_weight": longest_wait_weight,
-        "queue_thresholds": QUEUE_THRESHOLDS,
-        "red_time_thresholds_seconds": None,
-        "reward": "negative_queue_plus_weighted_longest_wait",
-    }
+    training_settings = _build_training_settings(
+        interval,
+        minimum_green_duration,
+        decision_interval,
+        maximum_red_time,
+        longest_wait_weight,
+    )
     if resume:
         q_table = _load_q_table(
             q_table_file_path, intersection_specs, training_settings
@@ -608,7 +640,10 @@ def run_rl_training(
                             interval,
                         )
                         state = _queue_state(
-                            lane_waiting_counts, spec, red_times
+                            lane_waiting_counts,
+                            spec,
+                            red_times,
+                            active_actions.get(intersection_id),
                         )
                         decision_states[intersection_id] = state
                         decision_rewards[intersection_id] = 0.0
@@ -675,6 +710,7 @@ def run_rl_training(
                                 next_lane_waiting_counts,
                                 spec,
                                 next_red_times,
+                                action,
                             )
                             _update_q_value(
                                 q_table,

@@ -81,8 +81,21 @@ class TestQLearningTraining(unittest.TestCase):
             train._fixed_time_phase(specs["junction"], step=1, interval=1),
             0,
         )
-        state = train._queue_state({"north_0": 81}, specs["junction"])
-        self.assertEqual(state, (6, 0))
+        state = train._queue_state(
+            {"north_0": 81}, specs["junction"], active_action=2
+        )
+        self.assertEqual(state, (6, 0, 1))
+
+    def test_uninitialized_current_green_is_distinct_in_state(self):
+        spec = {
+            "actions": (0, 2),
+            "phase_lanes": {0: ("north_0",), 2: ("south_0",)},
+        }
+
+        self.assertEqual(train._queue_state({}, spec), (0, 0, -1))
+        self.assertEqual(
+            train._queue_state({}, spec, active_action=0), (0, 0, 0)
+        )
 
     def test_q_learning_applies_bellman_update(self):
         q_table = {
@@ -146,6 +159,39 @@ class TestQLearningTraining(unittest.TestCase):
             ),
             2,
         )
+
+    def test_unseen_state_fallback_ignores_current_green_component(self):
+        self.assertEqual(
+            train._greedy_action(
+                {},
+                "junction",
+                (1, 5, 0),
+                (0, 2),
+                fixed_time_action=0,
+            ),
+            2,
+        )
+
+    def test_q_table_rejects_mismatched_training_settings(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "q_table.joblib"
+            specs = {"junction": {"actions": (0, 2)}}
+            joblib.dump(
+                {
+                    "format_version": train.Q_TABLE_FORMAT_VERSION,
+                    "actions": {"junction": [0, 2]},
+                    "training_settings": {"state_representation": "old"},
+                    "q_table": {},
+                },
+                path,
+            )
+
+            with self.assertRaisesRegex(ValueError, "different state"):
+                train._load_q_table(
+                    path,
+                    specs,
+                    {"state_representation": "queue_levels_plus_current_green_action"},
+                )
 
     def test_minimum_green_hold(self):
         self.assertTrue(train._hold_green_action(2, 4, 5))
@@ -296,7 +342,7 @@ class TestQLearningTraining(unittest.TestCase):
             self.assertTrue(metrics_path.is_file())
             self.assertEqual(q_update.call_count, 3)
             saved_table = joblib.load(q_table_path)
-            self.assertEqual(saved_table["format_version"], 3)
+            self.assertEqual(saved_table["format_version"], 4)
             self.assertEqual(
                 saved_table["training_settings"]["decision_steps"], 10
             )
@@ -304,6 +350,10 @@ class TestQLearningTraining(unittest.TestCase):
                 saved_table["training_settings"]["red_time_thresholds_seconds"]
             )
             self.assertTrue(saved_table["q_table"])
+            self.assertEqual(
+                saved_table["training_settings"]["state_representation"],
+                "queue_levels_plus_current_green_action",
+            )
             self.assertNotIn((99, 99), saved_table["q_table"]["junction"])
             self.assertTrue(engine.actions)
             self.assertTrue(all(phase in (0, 2) for _, phase in engine.actions))
