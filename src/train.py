@@ -13,9 +13,8 @@ import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-QUEUE_THRESHOLDS = (0, 2, 5, 10, 20, 40, 80)
-RED_TIME_THRESHOLDS_SECONDS = (0, 10, 20, 40, 60, 90)
-Q_TABLE_FORMAT_VERSION = 2
+QUEUE_THRESHOLDS = (2, 5, 10, 20, 40, 80)
+Q_TABLE_FORMAT_VERSION = 3
 
 
 def _project_path(path):
@@ -104,21 +103,13 @@ def _build_intersection_specs(roadnet):
 
 
 def _queue_state(lane_waiting_counts, intersection_spec, red_times=None):
-    queue_levels = tuple(
+    return tuple(
         bisect_right(
             QUEUE_THRESHOLDS,
             sum(lane_waiting_counts.get(lane_id, 0) for lane_id in lane_ids),
         )
         for lane_ids in intersection_spec["phase_lanes"].values()
     )
-    red_time_levels = tuple(
-        bisect_right(
-            RED_TIME_THRESHOLDS_SECONDS,
-            (red_times or {}).get(action, 0.0),
-        )
-        for action in intersection_spec["actions"]
-    )
-    return queue_levels + red_time_levels
 
 
 def _intersection_queue(lane_waiting_counts, intersection_spec):
@@ -150,7 +141,7 @@ def _select_action(
 ):
     state_values = q_table.get(intersection_id, {}).get(state)
     if not state_values:
-        return fixed_time_action
+        return actions[max(range(len(actions)), key=lambda index: state[index])]
 
     if rng.random() < epsilon:
         return rng.choice(actions)
@@ -169,7 +160,7 @@ def _greedy_action(
 ):
     state_values = q_table.get(intersection_id, {}).get(state)
     if not state_values:
-        return fixed_time_action
+        return actions[max(range(len(actions)), key=lambda index: state[index])]
 
     return max(
         actions,
@@ -449,7 +440,7 @@ def run_rl_training(
     max_steps=3600,
     output_csv="data/training_metrics.csv",
     thread_num=4,
-    minimum_green_duration=10.0,
+    minimum_green_duration=20.0,
     decision_interval=10.0,
     maximum_red_time=80.0,
     learning_rate=0.1,
@@ -519,7 +510,7 @@ def run_rl_training(
         "minimum_green_steps": minimum_green_steps,
         "longest_wait_weight": longest_wait_weight,
         "queue_thresholds": QUEUE_THRESHOLDS,
-        "red_time_thresholds_seconds": RED_TIME_THRESHOLDS_SECONDS,
+        "red_time_thresholds_seconds": None,
         "reward": "negative_queue_plus_weighted_longest_wait",
     }
     if resume:

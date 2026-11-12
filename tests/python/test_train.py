@@ -81,13 +81,8 @@ class TestQLearningTraining(unittest.TestCase):
             train._fixed_time_phase(specs["junction"], step=1, interval=1),
             0,
         )
-        state = train._queue_state(
-            {"north_0": 81},
-            specs["junction"],
-            {0: 100, 2: 0},
-        )
-        self.assertEqual(state[-2:], (6, 1))
-        self.assertGreater(state[0], 5)
+        state = train._queue_state({"north_0": 81}, specs["junction"])
+        self.assertEqual(state, (6, 0))
 
     def test_q_learning_applies_bellman_update(self):
         q_table = {
@@ -112,18 +107,18 @@ class TestQLearningTraining(unittest.TestCase):
 
         self.assertEqual(q_table["junction"][(1,)][0], 4.75)
 
-    def test_unseen_states_use_fixed_time_phase(self):
+    def test_unseen_states_use_phase_with_longest_queue(self):
         unseen_q_table = {}
 
         self.assertEqual(
             train._select_action(
                 unseen_q_table,
                 "junction",
-                (0,),
+                (1, 5),
                 (0, 2),
                 epsilon=1,
                 rng=random.Random(1),
-                fixed_time_action=2,
+                fixed_time_action=0,
             ),
             2,
         )
@@ -131,9 +126,9 @@ class TestQLearningTraining(unittest.TestCase):
             train._greedy_action(
                 unseen_q_table,
                 "junction",
-                (0,),
+                (1, 5),
                 (0, 2),
-                fixed_time_action=2,
+                fixed_time_action=0,
             ),
             2,
         )
@@ -161,6 +156,26 @@ class TestQLearningTraining(unittest.TestCase):
         self.assertEqual(
             inspect.signature(train.run_rl_training).parameters["episodes"].default,
             500,
+        )
+
+    def test_requested_training_and_evaluation_defaults(self):
+        self.assertEqual(
+            inspect.signature(train.run_rl_training)
+            .parameters["minimum_green_duration"]
+            .default,
+            20.0,
+        )
+        self.assertEqual(
+            inspect.signature(evaluate.run_evaluation)
+            .parameters["minimum_green_duration"]
+            .default,
+            20.0,
+        )
+        self.assertEqual(
+            inspect.signature(evaluate.run_evaluation)
+            .parameters["breakdown_probability"]
+            .default,
+            1.0,
         )
 
     def test_longest_red_phase_is_forced_when_due(self):
@@ -281,9 +296,12 @@ class TestQLearningTraining(unittest.TestCase):
             self.assertTrue(metrics_path.is_file())
             self.assertEqual(q_update.call_count, 3)
             saved_table = joblib.load(q_table_path)
-            self.assertEqual(saved_table["format_version"], 2)
+            self.assertEqual(saved_table["format_version"], 3)
             self.assertEqual(
                 saved_table["training_settings"]["decision_steps"], 10
+            )
+            self.assertIsNone(
+                saved_table["training_settings"]["red_time_thresholds_seconds"]
             )
             self.assertTrue(saved_table["q_table"])
             self.assertNotIn((99, 99), saved_table["q_table"]["junction"])
