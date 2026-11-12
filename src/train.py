@@ -1,3 +1,5 @@
+import argparse
+import hashlib
 import json
 import math
 import os
@@ -14,12 +16,120 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 QUEUE_THRESHOLDS = (2, 5, 10, 20, 40, 80)
-Q_TABLE_FORMAT_VERSION = 4
+Q_TABLE_FORMAT_VERSION = 5
 
 
 def _project_path(path):
     path = Path(path)
     return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_rf_bundle(path):
+    bundle_path = _project_path(path)
+    if not bundle_path.is_file():
+        raise FileNotFoundError(f"RF model bundle not found: {bundle_path}")
+    bundle = joblib.load(bundle_path)
+    required_keys = {
+        "model",
+        "feature_names",
+        "v0",
+        "gamma",
+        "teacher",
+        "episodes",
+    }
+    if not isinstance(bundle, dict) or not required_keys.issubset(bundle):
+        raise ValueError(f"Invalid RF model bundle: {bundle_path}")
+    if bundle["gamma"] != 0.95 or bundle["teacher"] != "LQF":
+        raise ValueError(
+            "The RF bundle must use gamma 0.95 and the LQF teacher."
+        )
+    feature_names = bundle["feature_names"]
+    if not isinstance(feature_names, list) or "current_phase" not in feature_names:
+        raise ValueError(
+            "The RF bundle must include an ordered feature_names list with "
+            "'current_phase'."
+        )
+    model = bundle["model"]
+    model_features = getattr(model, "feature_names_in_", None)
+    if model_features is not None and list(model_features) != feature_names:
+        raise ValueError("RF model feature names do not match its bundle.")
+    if not hasattr(model, "predict_proba"):
+        raise ValueError("The RF model must support predict_proba.")
+    return bundle, _sha256_file(bundle_path)
+
+
+def _rf_probabilities(bundle, lane_waiting_counts, current_phase, actions):
+    feature_names = bundle["feature_names"]
+    features = pd.DataFrame(
+        [
+            {
+                name: (
+                    current_phase
+                    if name == "current_phase"
+                    else lane_waiting_counts.get(name, 0)
+                )
+                for name in feature_names
+            }
+        ],
+        columns=feature_names,
+    )
+    probabilities = bundle["model"].predict_proba(features)[0]
+    classes = list(bundle["model"].classes_)
+    action_probabilities = {
+        action: float(
+            probabilities[classes.index(action)]
+            if action in classes
+            else 0.0
+        )
+        for action in actions
+    }
+    if not any(action_probabilities.values()):
+        raise ValueError(
+            "The RF model has no probability for any controllable green phase."
+        )
+    return action_probabilities
+
+
+def _initialize_q_state_from_rf(
+    q_table,
+    intersection_id,
+    state,
+    actions,
+    bundle,
+    lane_waiting_counts,
+    current_phase,
+    prior_weight,
+):
+    intersection_table = q_table.setdefault(intersection_id, {})
+    if state in intersection_table:
+        return False
+    probabilities = _rf_probabilities(
+        bundle, lane_waiting_counts, current_phase, actions
+    )
+    v0 = float(bundle["v0"])
+    intersection_table[state] = {
+        action: v0
+        + prior_weight * abs(v0) * (probabilities[action] - 0.25)
+        for action in actions
+    }
+    return True
+
+
+def _rf_greedy_action(
+    bundle, lane_waiting_counts, current_phase, actions
+):
+    probabilities = _rf_probabilities(
+        bundle, lane_waiting_counts, current_phase, actions
+    )
+    return max(actions, key=lambda action: probabilities[action])
 
 
 def _load_cityflow_config(config_path):
@@ -125,6 +235,10 @@ def _build_training_settings(
     decision_interval,
     maximum_red_time,
     longest_wait_weight,
+    init_method="rf",
+    rf_prior_weight=0.1,
+    v0=0.0,
+    rf_model_sha256=None,
 ):
     return {
         "decision_steps": max(1, math.ceil(decision_interval / interval)),
@@ -137,6 +251,10 @@ def _build_training_settings(
         "red_time_thresholds_seconds": None,
         "reward": "negative_queue_plus_weighted_longest_wait",
         "state_representation": "queue_levels_plus_current_green_action",
+        "init_method": init_method,
+        "rf_prior_weight": rf_prior_weight,
+        "v0": v0,
+        "rf_model_sha256": rf_model_sha256,
     }
 
 
@@ -366,8 +484,9 @@ def _load_q_table(
         and payload.get("training_settings") != expected_training_settings
     ):
         raise ValueError(
-            "The saved Q-table was trained with different state, reward, or "
-            "timing settings. Start fresh with resume=False."
+            "The saved Q-table was trained with different state, reward, "
+            "timing, initialisation, or RF bundle settings. Start fresh with "
+            "resume=False."
         )
     return payload["q_table"]
 
@@ -472,7 +591,7 @@ def run_rl_training(
     q_table_path="models/q_table.joblib",
     episodes=500,
     max_steps=3600,
-    output_csv="data/training_metrics.csv",
+    output_csv="data/training_metrics_hybrid.csv",
     thread_num=4,
     minimum_green_duration=20.0,
     decision_interval=10.0,
@@ -488,6 +607,9 @@ def run_rl_training(
     longest_wait_weight=0.1,
     resume=False,
     seed=0,
+    init_method="rf",
+    rf_model_path="models/rf_pretrain.joblib",
+    rf_prior_weight=0.1,
 ):
     if episodes <= 0:
         raise ValueError("episodes must be a positive integer.")
@@ -517,6 +639,10 @@ def run_rl_training(
         raise ValueError("breakdown_probability must be in the range [0, 1].")
     if breakdown_duration_steps <= 0:
         raise ValueError("breakdown_duration_steps must be positive.")
+    if init_method not in {"rf", "none"}:
+        raise ValueError("init_method must be either 'rf' or 'none'.")
+    if rf_prior_weight < 0:
+        raise ValueError("rf_prior_weight cannot be negative.")
 
     config_file_path = _project_path(config_path)
     q_table_file_path = _project_path(q_table_path)
@@ -533,6 +659,20 @@ def run_rl_training(
         flows = json.load(flow_file)
     intersection_specs = _build_intersection_specs(roadnet)
     q_table = {}
+    rf_bundle = None
+    rf_model_sha256 = None
+    v0 = 0.0
+    rf_model_file_path = _project_path(rf_model_path)
+    if rf_model_file_path.is_file():
+        rf_bundle, rf_model_sha256 = _load_rf_bundle(rf_model_file_path)
+        v0 = float(rf_bundle["v0"])
+    elif init_method == "rf":
+        raise FileNotFoundError(
+            f"RF model bundle not found: {rf_model_file_path}. "
+            "Run src/collector.py and src/pretrainer.py first."
+        )
+    if init_method == "rf" and rf_bundle is None:
+        raise ValueError("RF initialisation requires a valid RF model bundle.")
     interval = config.get("interval", 1.0)
     if interval <= 0:
         raise ValueError("CityFlow interval must be positive.")
@@ -544,6 +684,10 @@ def run_rl_training(
         decision_interval,
         maximum_red_time,
         longest_wait_weight,
+        init_method,
+        rf_prior_weight,
+        v0,
+        rf_model_sha256,
     )
     if resume:
         q_table = _load_q_table(
@@ -553,6 +697,7 @@ def run_rl_training(
     output_file_path.parent.mkdir(parents=True, exist_ok=True)
     q_table_file_path.parent.mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
+    scenario_rng = random.Random(seed)
     print(
         f"Starting Q-Learning for {episodes} episodes "
         f"with +/-{demand_variation:.0%} demand variation, "
@@ -560,9 +705,12 @@ def run_rl_training(
         f"{breakdown_probability:.0%} breakdown probability "
         f"(decisions every {decision_steps * interval:g}s, "
         f"minimum green {minimum_green_duration:g}s, "
-        f"maximum red {maximum_red_time:g}s)..."
+        f"maximum red {maximum_red_time:g}s, "
+        f"initialisation {init_method})..."
     )
 
+    total_rf_initialized_states = 0
+    episode_metric_rows = []
     with tempfile.TemporaryDirectory() as temp_dir:
         total_decisions = episodes * math.ceil(max_steps / decision_steps)
         decision_count = 0
@@ -570,7 +718,7 @@ def run_rl_training(
             scenario = _generate_scenario_uncertainties(
                 roadnet,
                 max_steps,
-                rng,
+                scenario_rng,
                 demand_variation,
                 vehicle_speed_variation,
                 breakdown_probability,
@@ -606,7 +754,6 @@ def run_rl_training(
                 str(engine_config_path), thread_num=thread_num
             )
 
-            episode_rows = []
             affected_vehicles = {}
             active_actions = {}
             green_elapsed_steps = {}
@@ -620,6 +767,10 @@ def run_rl_training(
             decision_rewards = {
                 intersection_id: 0.0 for intersection_id in intersection_specs
             }
+            rf_initialized_before_episode = total_rf_initialized_states
+            epsilon = epsilon_start
+            episode_queue_sum = 0
+            episode_peak_queue = 0
             lane_waiting_counts = engine.get_lane_waiting_vehicle_count()
             for step in range(1, max_steps + 1):
                 _apply_scenario_incidents(
@@ -647,6 +798,25 @@ def run_rl_training(
                         )
                         decision_states[intersection_id] = state
                         decision_rewards[intersection_id] = 0.0
+                        if (
+                            init_method == "rf"
+                            and state
+                            not in q_table.get(intersection_id, {})
+                        ):
+                            current_phase = active_actions.get(
+                                intersection_id, spec["actions"][0]
+                            )
+                            if _initialize_q_state_from_rf(
+                                q_table,
+                                intersection_id,
+                                state,
+                                spec["actions"],
+                                rf_bundle,
+                                lane_waiting_counts,
+                                current_phase,
+                                rf_prior_weight,
+                            ):
+                                total_rf_initialized_states += 1
                         action = _choose_control_action(
                             q_table,
                             intersection_id,
@@ -726,35 +896,36 @@ def run_rl_training(
                             )
 
                 lane_waiting_counts = next_lane_waiting_counts
-                episode_rows.append(
-                    {
-                        "episode": episode,
-                        "step": step,
-                        "demand_scale": demand_scale,
-                        "vehicle_speed_scale": scenario["vehicle_speed_scale"],
-                        "breakdown_count": len(scenario["incidents"]),
-                        "total_queue_length": sum(next_lane_waiting_counts.values()),
-                        "average_travel_time": engine.get_average_travel_time(),
-                    }
-                )
+                queue_length = sum(next_lane_waiting_counts.values())
+                episode_queue_sum += queue_length
+                episode_peak_queue = max(episode_peak_queue, queue_length)
 
-            episode_metrics = pd.DataFrame(episode_rows)
-            episode_metrics.to_csv(
-                output_file_path,
-                index=False,
-                mode="w" if episode == 1 else "a",
-                header=episode == 1,
+            final_average_travel_time = engine.get_average_travel_time()
+            episode_metric_rows.append(
+                {
+                    "episode": episode,
+                    "demand_scale": demand_scale,
+                    "travel_time": final_average_travel_time,
+                    "epsilon": epsilon,
+                    "states_initialised_from_rf": (
+                        total_rf_initialized_states
+                        - rf_initialized_before_episode
+                    ),
+                    "peak_queue": episode_peak_queue,
+                    "mean_queue": episode_queue_sum / max_steps,
+                    "vehicle_speed_scale": scenario["vehicle_speed_scale"],
+                    "breakdown_count": len(scenario["incidents"]),
+                }
             )
-            final_average_travel_time = episode_metrics[
-                "average_travel_time"
-            ].iloc[-1]
-            peak_queue_length = episode_metrics["total_queue_length"].max()
             print(
                 f"Episode {episode}/{episodes} - "
                 f"final average travel time: {final_average_travel_time:.2f} seconds, "
-                f"peak queue length: {peak_queue_length}"
+                f"peak queue length: {episode_peak_queue}, "
+                f"RF-initialised states: "
+                f"{episode_metric_rows[-1]['states_initialised_from_rf']}"
             )
 
+    pd.DataFrame(episode_metric_rows).to_csv(output_file_path, index=False)
     joblib.dump(
         {
             "format_version": Q_TABLE_FORMAT_VERSION,
@@ -768,9 +939,31 @@ def run_rl_training(
         q_table_file_path,
     )
     print(f"Learned Q-table saved to {q_table_file_path}")
-    print(f"Step-by-step training metrics saved to {output_file_path}")
+    print(f"Per-episode training metrics saved to {output_file_path}")
+    print(
+        "Total Q-table states initialised from the RF: "
+        f"{total_rf_initialized_states}"
+    )
     return q_table
 
 
 if __name__ == "__main__":
-    run_rl_training()
+    parser = argparse.ArgumentParser(description="Train the CityFlow Q-learning policy.")
+    parser.add_argument("--init", choices=("rf", "none"), default="rf")
+    parser.add_argument("--q-table", default="models/q_table.joblib")
+    parser.add_argument("--output-csv", default="data/training_metrics_hybrid.csv")
+    parser.add_argument("--rf-model-path", default="models/rf_pretrain.joblib")
+    parser.add_argument("--rf-prior-weight", type=float, default=0.1)
+    parser.add_argument("--episodes", type=int, default=500)
+    parser.add_argument("--seed", type=int, default=0)
+    arguments = parser.parse_args()
+    run_rl_training(
+        q_table_path=arguments.q_table,
+        output_csv=arguments.output_csv,
+        init_method=arguments.init,
+        rf_model_path=arguments.rf_model_path,
+        rf_prior_weight=arguments.rf_prior_weight,
+        episodes=arguments.episodes,
+        seed=arguments.seed,
+        resume=False,
+    )

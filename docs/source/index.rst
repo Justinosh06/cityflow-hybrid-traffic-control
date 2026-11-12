@@ -16,3 +16,4 @@ Welcome to CityFlow's documentation!
     roadnet
     flow
     replay
+    hybrid_training

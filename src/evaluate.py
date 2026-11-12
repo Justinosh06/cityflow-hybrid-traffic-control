@@ -7,7 +7,6 @@ import tempfile
 from pathlib import Path
 
 import cityflow
-import joblib
 import pandas as pd
 from sklearn.metrics import confusion_matrix
 
@@ -172,10 +171,98 @@ def _build_action_confusion_matrix(
     )
 
 
+def _make_rf_action_fn(
+    rf_bundle,
+    intersection_specs,
+    interval,
+    decision_steps,
+    minimum_green_steps,
+    maximum_red_time,
+):
+    controller_state = {}
+
+    def action_fn(engine, step, scenario):
+        if controller_state.get("scenario") != scenario["scenario"]:
+            controller_state.clear()
+            controller_state.update(
+                {
+                    "scenario": scenario["scenario"],
+                    "active_actions": {},
+                    "green_elapsed_steps": {},
+                    "last_green_steps": {
+                        intersection_id: {
+                            action: 0 for action in spec["actions"]
+                        }
+                        for intersection_id, spec in intersection_specs.items()
+                    },
+                }
+            )
+        active_actions = controller_state["active_actions"]
+        green_elapsed_steps = controller_state["green_elapsed_steps"]
+        last_green_steps = controller_state["last_green_steps"]
+        lane_waiting_counts = engine.get_lane_waiting_vehicle_count()
+        selected_actions = {}
+        for intersection_id, spec in intersection_specs.items():
+            if (step - 1) % decision_steps == 0:
+                red_times = train._red_times_at_step(
+                    step,
+                    last_green_steps[intersection_id],
+                    spec["actions"],
+                    interval,
+                )
+                active_action = active_actions.get(intersection_id)
+                if train._hold_green_action(
+                    active_action,
+                    green_elapsed_steps.get(intersection_id, 0),
+                    minimum_green_steps,
+                    spec["actions"],
+                ):
+                    action = active_action
+                else:
+                    overdue_actions = [
+                        phase
+                        for phase in spec["actions"]
+                        if red_times[phase] >= maximum_red_time
+                    ]
+                    if overdue_actions:
+                        action = max(
+                            overdue_actions,
+                            key=lambda phase: red_times[phase],
+                        )
+                    else:
+                        current_phase = (
+                            active_action
+                            if active_action is not None
+                            else spec["actions"][0]
+                        )
+                        action = train._rf_greedy_action(
+                            rf_bundle,
+                            lane_waiting_counts,
+                            current_phase,
+                            spec["actions"],
+                        )
+            else:
+                action = active_actions[intersection_id]
+            selected_actions[intersection_id] = action
+            train._update_phase_timing(
+                intersection_id,
+                action,
+                spec["actions"],
+                step,
+                active_actions,
+                green_elapsed_steps,
+                last_green_steps,
+            )
+        return selected_actions
+
+    return action_fn
+
+
 def run_evaluation(
     config_path="data/config.json",
     model_path="models/rf_pretrain.joblib",
     q_table_path="models/q_table.joblib",
+    cold_q_table_path="models/q_table_cold.joblib",
     output_csv="data/evaluation_metrics.csv",
     confusion_matrix_csv="data/evaluation_confusion_matrix.csv",
     max_steps=3600,
@@ -188,6 +275,7 @@ def run_evaluation(
     minimum_green_duration=20.0,
     decision_interval=10.0,
     maximum_red_time=80.0,
+    rf_prior_weight=0.1,
     seed=0,
 ):
     if max_steps <= 0:
@@ -202,6 +290,7 @@ def run_evaluation(
     config_file_path = _project_path(config_path)
     model_file_path = _project_path(model_path)
     q_table_file_path = _project_path(q_table_path)
+    cold_q_table_file_path = _project_path(cold_q_table_path)
     output_file_path = _project_path(output_csv)
     confusion_matrix_path = _project_path(confusion_matrix_csv)
     if not config_file_path.is_file():
@@ -215,6 +304,13 @@ def run_evaluation(
             f"Q-learning table not found: {q_table_file_path}. "
             "Run train.py first."
         )
+    if not cold_q_table_file_path.is_file():
+        raise FileNotFoundError(
+            f"Cold-start Q-learning table not found: "
+            f"{cold_q_table_file_path}. Run train.py with --init none first."
+        )
+    if rf_prior_weight < 0:
+        raise ValueError("rf_prior_weight cannot be negative.")
 
     config = _load_cityflow_config(config_file_path)
     roadnet_path = Path(config["dir"]) / config["roadnetFile"]
@@ -236,34 +332,14 @@ def run_evaluation(
     intersection_specs = train._build_intersection_specs(roadnet)
     intersections = list(intersection_specs)
 
-    model = joblib.load(model_file_path)
-    expected_features = getattr(model, "feature_names_in_", None)
-    if expected_features is None:
-        raise ValueError(
-            "The pre-trained Random Forest does not expose feature_names_in_; "
-            "cannot safely align lane-count features."
-        )
-    expected_features = list(expected_features)
+    rf_bundle, rf_model_sha256 = train._load_rf_bundle(model_file_path)
+    model = rf_bundle["model"]
     known_actions = set(getattr(model, "classes_", []))
     known_actions.update(
         action
         for spec in intersection_specs.values()
         for action in spec["actions"]
     )
-
-    def rf_action_fn(engine, _step, _scenario):
-        lane_vehicle_counts = engine.get_lane_vehicle_count()
-        state = pd.DataFrame(
-            [
-                {
-                    feature: lane_vehicle_counts.get(feature, 0)
-                    for feature in expected_features
-                }
-            ],
-            columns=expected_features,
-        )
-        action = int(model.predict(state)[0])
-        return {intersection_id: action for intersection_id in intersections}
 
     interval = config.get("interval", 1.0)
     if interval <= 0:
@@ -278,82 +354,114 @@ def run_evaluation(
         decision_interval,
         maximum_red_time,
         longest_wait_weight=0.1,
+        init_method="rf",
+        rf_prior_weight=rf_prior_weight,
+        v0=float(rf_bundle["v0"]),
+        rf_model_sha256=rf_model_sha256,
     )
-    q_table = train._load_q_table(
+    hybrid_q_table = train._load_q_table(
         q_table_file_path,
         intersection_specs,
         expected_training_settings,
     )
-    controller_state = {}
-    controller_rng = random.Random(seed)
+    cold_training_settings = dict(expected_training_settings)
+    cold_training_settings["init_method"] = "none"
+    cold_q_table = train._load_q_table(
+        cold_q_table_file_path,
+        intersection_specs,
+        cold_training_settings,
+    )
 
-    def q_learning_action_fn(engine, step, scenario):
-        if controller_state.get("scenario") != scenario["scenario"]:
-            controller_state.clear()
-            controller_state.update(
-                {
-                    "scenario": scenario["scenario"],
-                    "active_actions": {},
-                    "green_elapsed_steps": {},
-                    "last_green_steps": {
-                        intersection_id: {
-                            action: 0 for action in spec["actions"]
-                        }
-                        for intersection_id, spec in intersection_specs.items()
-                    },
-                    "waiting_durations": {},
-                }
+    def make_q_action_fn(q_table, init_method):
+        controller_state = {}
+        controller_rng = random.Random(seed)
+
+        def action_fn(engine, step, scenario):
+            if controller_state.get("scenario") != scenario["scenario"]:
+                controller_state.clear()
+                controller_state.update(
+                    {
+                        "scenario": scenario["scenario"],
+                        "active_actions": {},
+                        "green_elapsed_steps": {},
+                        "last_green_steps": {
+                            intersection_id: {
+                                action: 0 for action in spec["actions"]
+                            }
+                            for intersection_id, spec in intersection_specs.items()
+                        },
+                        "waiting_durations": {},
+                    }
+                )
+            active_actions = controller_state["active_actions"]
+            green_elapsed_steps = controller_state["green_elapsed_steps"]
+            last_green_steps = controller_state["last_green_steps"]
+            waiting_durations = controller_state["waiting_durations"]
+            train._update_waiting_durations(
+                engine, waiting_durations, interval
             )
-
-        active_actions = controller_state["active_actions"]
-        green_elapsed_steps = controller_state["green_elapsed_steps"]
-        last_green_steps = controller_state["last_green_steps"]
-        waiting_durations = controller_state["waiting_durations"]
-        train._update_waiting_durations(engine, waiting_durations, interval)
-        lane_waiting_counts = engine.get_lane_waiting_vehicle_count()
-        selected_actions = {}
-        for intersection_id, spec in intersection_specs.items():
-            if (step - 1) % decision_steps == 0:
-                red_times = train._red_times_at_step(
-                    step,
-                    last_green_steps[intersection_id],
-                    spec["actions"],
-                    interval,
-                )
-                state = train._queue_state(
-                    lane_waiting_counts,
-                    spec,
-                    red_times,
-                    active_actions.get(intersection_id),
-                )
-                action = train._choose_control_action(
-                    q_table,
+            lane_waiting_counts = engine.get_lane_waiting_vehicle_count()
+            selected_actions = {}
+            for intersection_id, spec in intersection_specs.items():
+                if (step - 1) % decision_steps == 0:
+                    red_times = train._red_times_at_step(
+                        step,
+                        last_green_steps[intersection_id],
+                        spec["actions"],
+                        interval,
+                    )
+                    active_action = active_actions.get(intersection_id)
+                    state = train._queue_state(
+                        lane_waiting_counts,
+                        spec,
+                        red_times,
+                        active_action,
+                    )
+                    if init_method == "rf":
+                        train._initialize_q_state_from_rf(
+                            q_table,
+                            intersection_id,
+                            state,
+                            spec["actions"],
+                            rf_bundle,
+                            lane_waiting_counts,
+                            (
+                                active_action
+                                if active_action is not None
+                                else spec["actions"][0]
+                            ),
+                            rf_prior_weight,
+                        )
+                    action = train._choose_control_action(
+                        q_table,
+                        intersection_id,
+                        state,
+                        spec,
+                        step,
+                        interval,
+                        red_times,
+                        active_action,
+                        green_elapsed_steps.get(intersection_id, 0),
+                        minimum_green_steps,
+                        maximum_red_time,
+                        0.0,
+                        controller_rng,
+                    )
+                else:
+                    action = active_actions[intersection_id]
+                selected_actions[intersection_id] = action
+                train._update_phase_timing(
                     intersection_id,
-                    state,
-                    spec,
+                    action,
+                    spec["actions"],
                     step,
-                    interval,
-                    red_times,
-                    active_actions.get(intersection_id),
-                    green_elapsed_steps.get(intersection_id, 0),
-                    minimum_green_steps,
-                    maximum_red_time,
-                    0.0,
-                    controller_rng,
+                    active_actions,
+                    green_elapsed_steps,
+                    last_green_steps,
                 )
-            else:
-                action = active_actions[intersection_id]
-            selected_actions[intersection_id] = action
-            train._update_phase_timing(
-                intersection_id,
-                action,
-                spec["actions"],
-                step,
-                active_actions,
-                green_elapsed_steps,
-                last_green_steps,
-            )
-        return selected_actions
+            return selected_actions
+
+        return action_fn
 
     output_file_path.parent.mkdir(parents=True, exist_ok=True)
     confusion_matrix_path.parent.mkdir(parents=True, exist_ok=True)
@@ -367,9 +475,20 @@ def run_evaluation(
         f"maximum red {maximum_red_time:g}s)..."
     )
     for policy_name, action_fn in (
-        ("no_training", None),
-        ("pretrained_random_forest", rf_action_fn),
-        ("q_learning", q_learning_action_fn),
+        ("fixed_time", None),
+        (
+            "random_forest",
+            _make_rf_action_fn(
+                rf_bundle,
+                intersection_specs,
+                interval,
+                decision_steps,
+                minimum_green_steps,
+                maximum_red_time,
+            ),
+        ),
+        ("q_learning_cold", make_q_action_fn(cold_q_table, "none")),
+        ("hybrid_rf_q_learning", make_q_action_fn(hybrid_q_table, "rf")),
     ):
         metrics, actions = _run_policy(
             config,
@@ -382,44 +501,120 @@ def run_evaluation(
             thread_num,
             action_fn,
         )
-        policy_results.append((metrics, actions))
+        policy_results.append((policy_name, metrics, actions))
 
-    all_metrics = pd.concat(
-        [result[0] for result in policy_results], ignore_index=True
-    )
-    all_metrics.to_csv(output_file_path, index=False)
+    scenario_summaries = {}
+    for result in policy_results:
+        policy_name, metrics = result[0], result[1]
+        summaries = []
+        for scenario_id, scenario_metrics in metrics.groupby("scenario"):
+            summaries.append(
+                {
+                    "policy": policy_name,
+                    "scenario": scenario_id,
+                    "mean_travel_time": scenario_metrics[
+                        "average_travel_time"
+                    ].iloc[-1],
+                    "mean_peak_queue": scenario_metrics[
+                        "total_queue_length"
+                    ].max(),
+                    "mean_queue_over_hour": scenario_metrics[
+                        "total_queue_length"
+                    ].mean(),
+                }
+            )
+        scenario_summaries[policy_name] = summaries
+
+    rf_actions = policy_results[1][2]
+    hybrid_actions = policy_results[3][2]
+    decision_rf_actions = []
+    decision_hybrid_actions = []
+    agreement_by_scenario = {}
+    for scenario_index in range(scenario_count):
+        scenario_start = scenario_index * max_steps
+        indices = range(
+            scenario_start,
+            scenario_start + max_steps,
+            decision_steps,
+        )
+        scenario_rf = [rf_actions[index] for index in indices]
+        scenario_indices = range(
+            scenario_start,
+            scenario_start + max_steps,
+            decision_steps,
+        )
+        scenario_hybrid = [hybrid_actions[index] for index in scenario_indices]
+        decision_rf_actions.extend(scenario_rf)
+        decision_hybrid_actions.extend(scenario_hybrid)
+        comparisons = [
+            rf_step[intersection_id] == hybrid_step[intersection_id]
+            for rf_step, hybrid_step in zip(scenario_rf, scenario_hybrid)
+            for intersection_id in intersections
+        ]
+        agreement_by_scenario[scenario_index + 1] = (
+            sum(comparisons) / len(comparisons) if comparisons else float("nan")
+        )
+
     matrix = _build_action_confusion_matrix(
-        policy_results[1][1],
-        policy_results[2][1],
+        rf_actions,
+        hybrid_actions,
         intersections,
         known_actions,
     )
+    summary_rows = []
+    for policy_name, summaries in scenario_summaries.items():
+        for summary in summaries:
+            summary["rf_q_agreement_rate"] = (
+                agreement_by_scenario[summary["scenario"]]
+                if policy_name == "hybrid_rf_q_learning"
+                else float("nan")
+            )
+            summary_rows.append(summary)
+        average = pd.DataFrame(summaries)[
+            ["mean_travel_time", "mean_peak_queue", "mean_queue_over_hour"]
+        ].mean()
+        summary_rows.append(
+            {
+                "policy": policy_name,
+                "scenario": "mean",
+                "mean_travel_time": average["mean_travel_time"],
+                "mean_peak_queue": average["mean_peak_queue"],
+                "mean_queue_over_hour": average["mean_queue_over_hour"],
+                "rf_q_agreement_rate": (
+                    sum(agreement_by_scenario.values())
+                    / len(agreement_by_scenario)
+                    if policy_name == "hybrid_rf_q_learning"
+                    else float("nan")
+                ),
+            }
+        )
+    summary_metrics = pd.DataFrame(summary_rows)
+    summary_metrics.to_csv(output_file_path, index=False)
     matrix.to_csv(confusion_matrix_path)
 
     print("Evaluation summary:")
-    for policy_name, (metrics, _) in zip(
-        ("no_training", "pretrained_random_forest", "q_learning"),
-        policy_results,
-    ):
-        scenario_results = metrics.groupby("scenario").agg(
-            final_average_travel_time=("average_travel_time", "last"),
-            peak_queue_length=("total_queue_length", "max"),
-        )
-        final_average_travel_time = scenario_results[
-            "final_average_travel_time"
-        ].mean()
-        peak_queue_length = scenario_results["peak_queue_length"].mean()
+    for result in policy_results:
+        policy_name = result[0]
+        average = summary_metrics[
+            (summary_metrics["policy"] == policy_name)
+            & (summary_metrics["scenario"] == "mean")
+        ].iloc[0]
         print(
-            f"  {policy_name}: mean final average travel time "
-            f"{final_average_travel_time:.2f} seconds across scenarios, "
-            f"mean peak queue length {peak_queue_length:.2f}"
+            f"  {policy_name}: mean travel time "
+            f"{average['mean_travel_time']:.2f}s, mean peak queue "
+            f"{average['mean_peak_queue']:.2f}, mean hourly queue "
+            f"{average['mean_queue_over_hour']:.2f}"
         )
+    mean_agreement = sum(agreement_by_scenario.values()) / len(
+        agreement_by_scenario
+    )
+    print(f"RF/Q-table agreement rate: {mean_agreement:.2%}")
     print(
-        "Confusion matrix (rows: RF actions, columns: Q-learning actions) "
+        "Confusion matrix (rows: RF actions, columns: hybrid Q-learning actions) "
         f"saved to {confusion_matrix_path}"
     )
-    print(f"Step-by-step comparison saved to {output_file_path}")
-    return all_metrics, matrix
+    print(f"Per-scenario policy metrics saved to {output_file_path}")
+    return summary_metrics, matrix
 
 
 if __name__ == "__main__":

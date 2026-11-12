@@ -9,6 +9,7 @@ from unittest.mock import patch
 import joblib
 
 from src import evaluate
+from src import collector
 from src import train
 
 
@@ -45,6 +46,45 @@ class FakeEngine:
 
 
 class TestQLearningTraining(unittest.TestCase):
+    def test_lqf_teacher_honors_timing_rules_then_breaks_queue_ties_by_phase(self):
+        spec = {
+            "actions": (0, 2, 4, 6),
+            "phase_lanes": {
+                0: ("lane_0",),
+                2: ("lane_2",),
+                4: ("lane_4",),
+                6: ("lane_6",),
+            },
+        }
+        counts = {
+            "lane_0": 5,
+            "lane_2": 5,
+            "lane_4": 1,
+            "lane_6": 0,
+        }
+
+        self.assertEqual(
+            collector._teacher_action(
+                spec, 100, 1, 2, 5, {0: 0, 2: 20, 4: 0, 6: 0},
+                20, 80, counts,
+            ),
+            2,
+        )
+        self.assertEqual(
+            collector._teacher_action(
+                spec, 100, 1, 2, 20, {0: 20, 2: 40, 4: 50, 6: 60},
+                20, 80, {**counts, "lane_6": 99},
+            ),
+            0,
+        )
+        self.assertEqual(
+            collector._teacher_action(
+                spec, 20, 1, 2, 20, {0: 0, 2: 20, 4: 0, 6: 0},
+                20, 80, counts,
+            ),
+            0,
+        )
+
     def test_intersection_uses_long_green_phases_and_incoming_lanes(self):
         specs = train._build_intersection_specs(
             {
@@ -146,6 +186,49 @@ class TestQLearningTraining(unittest.TestCase):
             2,
         )
 
+    def test_rf_prior_initialises_every_action_on_first_visit(self):
+        class FakeRF:
+            classes_ = [0, 2, 4, 6]
+
+            def predict_proba(self, _features):
+                return [[0.1, 0.2, 0.6, 0.1]]
+
+        q_table = {}
+        bundle = {
+            "model": FakeRF(),
+            "feature_names": ["north_0", "current_phase"],
+            "v0": -10.0,
+        }
+
+        initialized = train._initialize_q_state_from_rf(
+            q_table,
+            "junction",
+            (1, 2),
+            (0, 2, 4, 6),
+            bundle,
+            {"north_0": 3},
+            current_phase=0,
+            prior_weight=0.1,
+        )
+
+        self.assertTrue(initialized)
+        self.assertEqual(
+            q_table["junction"][(1, 2)],
+            {0: -10.15, 2: -10.05, 4: -9.65, 6: -10.15},
+        )
+        self.assertFalse(
+            train._initialize_q_state_from_rf(
+                q_table,
+                "junction",
+                (1, 2),
+                (0, 2, 4, 6),
+                bundle,
+                {"north_0": 90},
+                current_phase=4,
+                prior_weight=0.1,
+            )
+        )
+
     def test_greedy_action_uses_negative_infinity_for_missing_values(self):
         q_table = {"junction": {(0,): {2: -1.0}}}
 
@@ -176,11 +259,24 @@ class TestQLearningTraining(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "q_table.joblib"
             specs = {"junction": {"actions": (0, 2)}}
+            expected_settings = train._build_training_settings(
+                interval=1.0,
+                minimum_green_duration=20.0,
+                decision_interval=10.0,
+                maximum_red_time=80.0,
+                longest_wait_weight=0.1,
+                init_method="rf",
+                rf_prior_weight=0.1,
+                v0=-100.0,
+                rf_model_sha256="expected-hash",
+            )
+            mismatched_settings = dict(expected_settings)
+            mismatched_settings["rf_model_sha256"] = "different-hash"
             joblib.dump(
                 {
                     "format_version": train.Q_TABLE_FORMAT_VERSION,
                     "actions": {"junction": [0, 2]},
-                    "training_settings": {"state_representation": "old"},
+                    "training_settings": mismatched_settings,
                     "q_table": {},
                 },
                 path,
@@ -190,7 +286,7 @@ class TestQLearningTraining(unittest.TestCase):
                 train._load_q_table(
                     path,
                     specs,
-                    {"state_representation": "queue_levels_plus_current_green_action"},
+                    expected_settings,
                 )
 
     def test_minimum_green_hold(self):
@@ -336,15 +432,28 @@ class TestQLearningTraining(unittest.TestCase):
                     epsilon_start=1,
                     epsilon_end=1,
                     seed=7,
+                    init_method="none",
+                    rf_model_path=root / "missing_rf_bundle.joblib",
                 )
 
             self.assertTrue(q_table)
             self.assertTrue(metrics_path.is_file())
             self.assertEqual(q_update.call_count, 3)
             saved_table = joblib.load(q_table_path)
-            self.assertEqual(saved_table["format_version"], 4)
+            self.assertEqual(
+                saved_table["format_version"], train.Q_TABLE_FORMAT_VERSION
+            )
             self.assertEqual(
                 saved_table["training_settings"]["decision_steps"], 10
+            )
+            self.assertEqual(
+                saved_table["training_settings"]["init_method"], "none"
+            )
+            self.assertEqual(
+                saved_table["training_settings"]["rf_prior_weight"], 0.1
+            )
+            self.assertIsNone(
+                saved_table["training_settings"]["rf_model_sha256"]
             )
             self.assertIsNone(
                 saved_table["training_settings"]["red_time_thresholds_seconds"]
